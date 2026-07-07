@@ -29,7 +29,7 @@ const client = new MongoClient(uri, {
 });
 
 const database = client.db("Scamshield");
-const movies = database.collection("movies");
+const userCollection = database.collection("user");
 
 async function run() {
     await client.connect();
@@ -83,6 +83,13 @@ async function run() {
     });
   }
 });
+
+
+app.get('/user/:email',async(req,res)=>{
+  const {email}=req.params
+  const result=await userCollection.findOne({ email })
+  res.json(result)
+})
   
     await client.db("admin").command({ ping: 1 });
     console.log(
