@@ -4,9 +4,9 @@ import { MongoClient, ServerApiVersion, Collection } from "mongodb";
 import cors from "cors";
 import dotenv from "dotenv";
 import nodemailer from "nodemailer";
+import { scanSchema } from "./scan.js";
 const app = express();
 dotenv.config();
-
 
 app.use(cors());
 app.use(express.json());
@@ -55,13 +55,13 @@ async function run() {
       try {
         const { name, email, password } = req.body;
 
-        if ( !email) {
+        if (!email) {
           return res.status(400).json({
             success: false,
             message: " email is required",
           });
         }
-       
+
         // Check existing user
         const existingUser = await userCollection.findOne({ email });
 
@@ -108,7 +108,7 @@ async function run() {
         try {
           const { name, email } = req.body.data;
 
-          if ( !email) {
+          if (!email) {
             return res.status(400).json({
               success: false,
               message: " email are required",
@@ -187,45 +187,60 @@ async function run() {
     // =========================
     // Get User By Email
     // =========================
-app.get(
-  "/user/:email",
-  async (req: Request, res: Response): Promise<any> => {
-    try {
-const {email } = req.params
-console.log(email)
-      if (!email) {
+    app.get(
+      "/user/:email",
+      async (req: Request, res: Response): Promise<any> => {
+        try {
+          const { email } = req.params;
+          if (!email) {
+            return res.status(400).json({
+              success: false,
+              message: "Email is required",
+            });
+          }
+
+          const result = await userCollection.findOne({
+            email: email,
+          });
+
+          if (!result) {
+            return res.status(200).json({
+              success: true,
+              user: null,
+              message: "User not found",
+            });
+          }
+
+          return res.status(200).json({
+            success: true,
+            user: result,
+          });
+        } catch (error: any) {
+          console.error("Get User Error:", error);
+
+          return res.status(500).json({
+            success: false,
+            message: error.message,
+          });
+        }
+      },
+    );
+
+    app.post("/scanner-data", async (req, res) => {
+      const result = await scanSchema.safeParse(req.body);
+      
+  console.log(result);
+      if (!result.success) {
         return res.status(400).json({
           success: false,
-          message: "Email is required",
+          errors: result.error.flatten(),
         });
       }
-
-      const result = await userCollection.findOne({
-        email: email
-      });
-
-      if (!result) {
-        return res.status(200).json({
-          success: true,
-          user: null,
-          message: "User not found",
-        });
-      }
-
-      return res.status(200).json({
+      return res.json({
         success: true,
-        user: result,
+        data: result.data,
       });
-    } catch (error: any) {
-      console.error("Get User Error:", error);
-
-      return res.status(500).json({
-        success: false,
-        message: error.message,
-      });
-    }
-  },
-);
+    });
 
     app.listen(port, () => {
       console.log(`ScamShield server running on port ${port}`);
