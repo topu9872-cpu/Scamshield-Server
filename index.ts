@@ -1,18 +1,21 @@
 import process from "node:process";
 import express, { type Request, type Response } from "express";
-import { MongoClient, ServerApiVersion, Collection } from "mongodb";
+import { Collection, MongoClient, ServerApiVersion} from "mongodb";
 import cors from "cors";
 import dotenv from "dotenv";
 import nodemailer from "nodemailer";
 import { scanSchema } from "./scan.js";
 import { checkUrlWithGoogle } from "./googleSafeBrowsing.js";
 import { analyzeWithGemini } from "./gemini.js";
+import { checkUrlWithVirusTotal } from "./utils/virusTotal.js";
 const app = express();
 dotenv.config();
 app.use(cors());
 app.use(express.json());
 
 const port = process.env.PORT;
+
+
 
 const transporter = nodemailer.createTransport({
   service: "gmail",
@@ -37,6 +40,7 @@ interface User {
   name?: string;
   [key: string]: any;
 }
+
 
 const database = client.db("Scamshield");
 const userCollection: Collection<User> = database.collection("user");
@@ -219,67 +223,54 @@ async function run() {
       },
     );
 
- app.post("/scanner-data", async (req, res) => {
-  try {
-    // 1. Validate request
-    const result = scanSchema.safeParse(req.body);
+    app.post("/scanner-data", async (req, res) => {
+      try {
+        const result = scanSchema.safeParse(req.body);
+        if (!result.success) {
+          return res
+            .status(400)
+            .json({ success: false, errors: result.error.flatten() });
+        }
 
-    if (!result.success) {
-      return res.status(400).json({
-        success: false,
-        errors: result.error.flatten(),
-      });
-    }
+        const { type, value } = result.data;
+        const googleResult = await checkUrlWithGoogle(value);
 
-    const { type, value } = result.data;
+        // Optional: Keep VirusTotal call as requested in your snippet
+        await checkUrlWithVirusTotal(value).catch((err) =>
+          console.error("VirusTotal Error:", err),
+        );
 
-    // 2. Google Safe Browsing
-    const googleResult = await checkUrlWithGoogle(value);
+        let aiResult = {
+          isScam: false,
+          score: googleResult?.matches?.length ? 95 : 5,
+          summary: googleResult?.matches?.length
+            ? "Detected by Google Safe Browsing."
+            : "No known threats detected.",
+          insights: [
+            "Google Safe Browsing completed.",
+            "AI analysis unavailable.",
+          ],
+        };
 
-    // 3. Default AI result (fallback)
-    let aiResult = {
-      isScam: false,
-      score: googleResult?.matches?.length ? 95 : 5,
-      summary: googleResult?.matches?.length
-        ? "Detected by Google Safe Browsing."
-        : "No known threats detected.",
-      insights: [
-        "Google Safe Browsing completed.",
-        "AI analysis unavailable.",
-      ],
-    };
+        try {
+          aiResult = await analyzeWithGemini(type, value, googleResult);
+        } catch (error) {
+          console.error("Gemini Error:", error);
+          aiResult.insights.push(
+            "Gemini quota exceeded. Using fallback analysis.",
+          );
+        }
 
-    // 4. Try Gemini
-    try {
-      aiResult = await analyzeWithGemini(
-        type,
-        value,
-        googleResult
-      );
-    } catch (error) {
-      console.error("Gemini Error:", error);
-
-      aiResult.insights.push(
-        "Gemini quota exceeded. Using fallback analysis."
-      );
-    }
-
-    // 5. Send response
-    return res.json(aiResult);
-
-  } catch (error) {
-    console.error("Scanner Route Error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message:
-        error instanceof Error
-          ? error.message
-          : "Internal Server Error",
+        return res.json(aiResult);
+      } catch (error) {
+        console.error("Scanner Route Error:", error);
+        return res.status(500).json({
+          success: false,
+          message:
+            error instanceof Error ? error.message : "Internal Server Error",
+        });
+      }
     });
-  }
-});
-
 
     app.listen(port, () => {
       console.log(`ScamShield server running on port ${port}`);
