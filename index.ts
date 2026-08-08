@@ -1,6 +1,6 @@
 import process from "node:process";
 import express, { type Request, type Response } from "express";
-import { Collection, MongoClient, ServerApiVersion} from "mongodb";
+import { Collection, MongoClient, ServerApiVersion } from "mongodb";
 import cors from "cors";
 import dotenv from "dotenv";
 import nodemailer from "nodemailer";
@@ -13,9 +13,7 @@ dotenv.config();
 app.use(cors());
 app.use(express.json());
 
-const port = process.env.PORT;
-
-
+const port = Number(process.env.PORT ?? 5000);
 
 const transporter = nodemailer.createTransport({
   service: "gmail",
@@ -25,7 +23,12 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-const uri = process.env.MONGODB_URI as string;
+const uri = process.env.MONGODB_URI;
+if (!uri) {
+  throw new Error("MONGODB_URI environment variable is required");
+}
+
+const dbName = process.env.MONGODB_DB_NAME ?? "ScamShield";
 
 const client = new MongoClient(uri, {
   serverApi: {
@@ -33,6 +36,8 @@ const client = new MongoClient(uri, {
     strict: true,
     deprecationErrors: true,
   },
+  connectTimeoutMS: 10000,
+  serverSelectionTimeoutMS: 10000,
 });
 
 interface User {
@@ -41,18 +46,12 @@ interface User {
   [key: string]: any;
 }
 
-
-const database = client.db("Scamshield");
-const userCollection: Collection<User> = database.collection("user");
-
-app.use(express.json());
-
 async function run() {
   try {
     await client.connect();
 
-    const db = client.db("ScamShield");
-    const userCollection = db.collection("users");
+    const db = client.db(dbName);
+    const userCollection = db.collection<User>("users");
 
     console.log("MongoDB connected successfully");
 
