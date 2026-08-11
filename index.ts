@@ -45,6 +45,16 @@ interface User {
   name?: string;
   [key: string]: any;
 }
+interface ScanHistory {
+  userEmail: string;
+  type: "url" | "email" | "phone" | "text";
+  value: string;
+  score: number;
+  isScam: boolean;
+  summary: string;
+  insights: string[];
+  createdAt: Date;
+}
 
 async function run() {
   try {
@@ -52,7 +62,8 @@ async function run() {
 
     const db = client.db(dbName);
     const userCollection = db.collection<User>("users");
-
+    const scanHistoryCollection = db.collection<ScanHistory>("scan_history");
+    // const scanHistoryCollection: Collection<ScanHistory>;
     console.log("MongoDB connected successfully");
 
     app.post("/user", async (req: Request, res: Response): Promise<any> => {
@@ -232,6 +243,15 @@ async function run() {
         }
 
         const { type, value } = result.data;
+        const { userEmail } = req.body;
+
+        if (!userEmail) {
+          return res.status(400).json({
+            success: false,
+            message: "User email is required",
+          });
+        }
+
         const googleResult = await checkUrlWithGoogle(value);
 
         // Optional: Keep VirusTotal call as requested in your snippet
@@ -260,6 +280,17 @@ async function run() {
           );
         }
 
+        await scanHistoryCollection.insertOne({
+          userEmail,
+          type,
+          value,
+          score: aiResult.score,
+          isScam: aiResult.isScam,
+          summary: aiResult.summary,
+          insights: aiResult.insights,
+          createdAt: new Date(),
+        });
+
         return res.json(aiResult);
       } catch (error) {
         console.error("Scanner Route Error:", error);
@@ -271,8 +302,57 @@ async function run() {
       }
     });
 
-    app.listen(port, () => {
+    app.get(
+      "/scan-history/:email",
+      async (req: Request, res: Response): Promise<any> => {
+        try {
+          const { email } = req.params;
+
+          if (!email) {
+            return res.status(400).json({
+              success: false,
+              message: "Email is required",
+            });
+          }
+
+          const history = await scanHistoryCollection
+            .find({ userEmail: email })
+            .sort({ createdAt: -1 })
+            .toArray();
+
+          return res.status(200).json({
+            success: true,
+            history,
+          });
+        } catch (error) {
+          console.error("Scan History Error:", error);
+
+          return res.status(500).json({
+            success: false,
+            message:
+              error instanceof Error ? error.message : "Internal Server Error",
+          });
+        }
+      },
+    );
+
+    const server = app.listen(port, () => {
       console.log(`ScamShield server running on port ${port}`);
+    });
+
+    server.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EADDRINUSE") {
+        const fallbackPort = port + 1;
+        console.warn(
+          `Port ${port} is already in use. Trying fallback port ${fallbackPort}...`,
+        );
+        app.listen(fallbackPort, () => {
+          console.log(`ScamShield server running on port ${fallbackPort}`);
+        });
+      } else {
+        console.error("Server error:", err);
+        process.exit(1);
+      }
     });
   } catch (error) {
     console.error("MongoDB connection error:", error);
