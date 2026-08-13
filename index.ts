@@ -1,6 +1,6 @@
 import process from "node:process";
 import express, { type Request, type Response } from "express";
-import { Collection, MongoClient, ServerApiVersion } from "mongodb";
+import { MongoClient, ServerApiVersion } from "mongodb";
 import cors from "cors";
 import dotenv from "dotenv";
 import nodemailer from "nodemailer";
@@ -28,7 +28,7 @@ if (!uri) {
   throw new Error("MONGODB_URI environment variable is required");
 }
 
-const dbName = process.env.MONGODB_DB_NAME ?? "ScamShield";
+const dbName = (process.env.MONGODB_DB_NAME ?? "Scamshield").trim();
 
 const client = new MongoClient(uri, {
   serverApi: {
@@ -39,6 +39,11 @@ const client = new MongoClient(uri, {
   connectTimeoutMS: 10000,
   serverSelectionTimeoutMS: 10000,
 });
+
+let dbConnected = false;
+let userCollection: import("mongodb").Collection<User> | null = null;
+let scanHistoryCollection: import("mongodb").Collection<ScanHistory> | null =
+  null;
 
 interface User {
   email: string;
@@ -57,84 +62,87 @@ interface ScanHistory {
 }
 
 async function run() {
+  // Try to connect to MongoDB but don't block server startup on failure
   try {
     await client.connect();
 
     const db = client.db(dbName);
-    const userCollection = db.collection<User>("users");
-    const scanHistoryCollection = db.collection<ScanHistory>("scan_history");
-    // const scanHistoryCollection: Collection<ScanHistory>;
+
+    if (!process.env.MONGODB_DB_NAME) {
+      console.warn("MONGODB_DB_NAME not set, defaulting to 'Scamshield'");
+    }
+
+    userCollection = db.collection<User>("users");
+    scanHistoryCollection = db.collection<ScanHistory>("scan_history");
+
+    dbConnected = true;
     console.log("MongoDB connected successfully");
+  } catch (error) {
+    dbConnected = false;
+    console.error("MongoDB connection error:", error);
+  }
 
-    app.post("/user", async (req: Request, res: Response): Promise<any> => {
-      try {
-        const { name, email, password } = req.body;
+  app.post("/user", async (req: Request, res: Response): Promise<any> => {
+    try {
+      const { name, email, password } = req.body;
+      if (!email) {
+        return res
+          .status(400)
+          .json({ success: false, message: " email is required" });
+      }
 
-        if (!email) {
-          return res.status(400).json({
-            success: false,
-            message: " email is required",
-          });
-        }
+      if (!dbConnected || !userCollection) {
+        return res
+          .status(503)
+          .json({ success: false, message: "Database not available" });
+      }
 
-        // Check existing user
-        const existingUser = await userCollection.findOne({ email });
+      // Check existing user
+      const existingUser = await userCollection.findOne({ email });
 
-        if (existingUser) {
-          return res.status(409).json({
-            success: false,
-            message: "User already exists",
-          });
-        }
+      if (existingUser) {
+        return res
+          .status(409)
+          .json({ success: false, message: "User already exists" });
+      }
 
-        const newUser = {
-          name,
-          email,
-          password,
-          createdAt: new Date(),
-        };
+      const newUser = { name, email, password, createdAt: new Date() };
 
-        const result = await userCollection.insertOne(newUser);
+      const result = await userCollection.insertOne(newUser);
 
-        return res.status(200).json({
-          success: true,
-          message: "User created successfully",
-          user: {
-            id: result.insertedId,
-            name,
-            email,
-          },
-        });
-      } catch (error: any) {
-        console.error("Create User Error:", error);
+      return res.status(200).json({
+        success: true,
+        message: "User created successfully",
+        user: { id: result.insertedId, name, email },
+      });
+    } catch (error: any) {
+      console.error("Create User Error:", error);
 
-        return res.status(500).json({
+      return res.status(500).json({
+        success: false,
+        message: error.message,
+      });
+    }
+  });
+
+  // Send Welcome Email
+
+  app.post("/send-email", async (req: Request, res: Response): Promise<any> => {
+    try {
+      const { name, email } = req.body.data;
+
+      if (!email) {
+        return res.status(400).json({
           success: false,
-          message: error.message,
+          message: " email are required",
         });
       }
-    });
 
-    // Send Welcome Email
-
-    app.post(
-      "/send-email",
-      async (req: Request, res: Response): Promise<any> => {
-        try {
-          const { name, email } = req.body.data;
-
-          if (!email) {
-            return res.status(400).json({
-              success: false,
-              message: " email are required",
-            });
-          }
-
-          const mailOptions = {
-            from: process.env.EMAIL_USER,
-            to: email,
-            subject: "Welcome to ScamShield",
-            html: `
+      const mailOptions = {
+        from: process.env.EMAIL_USER,
+        to: email,
+        subject: "Welcome to ScamShield",
+        html: `
               <div style="
                 font-family: Arial, sans-serif;
                 max-width: 600px;
@@ -181,182 +189,229 @@ async function run() {
                 </p>
               </div>
             `,
-          };
+      };
 
-          await transporter.sendMail(mailOptions);
+      await transporter.sendMail(mailOptions);
 
-          return res.status(200).json({
-            success: true,
-            message: "Welcome email sent successfully",
-          });
-        } catch (error: any) {
-          console.error("Mail Error:", error);
+      return res.status(200).json({
+        success: true,
+        message: "Welcome email sent successfully",
+      });
+    } catch (error: any) {
+      console.error("Mail Error:", error);
 
-          return res.status(500).json({
-            success: false,
-            message: error.message,
-          });
-        }
-      },
-    );
-    // =========================
-    // Get User By Email
-    // =========================
-    app.get(
-      "/user/:email",
-      async (req: Request, res: Response): Promise<any> => {
-        try {
-          const { email } = req.params;
-          if (!email) {
-            return res.status(400).json({
-              success: false,
-              message: "Email is required",
-            });
-          }
+      return res.status(500).json({
+        success: false,
+        message: error.message,
+      });
+    }
+  });
+  // =========================
+  // Get User By Email
+  // =========================
+  app.get("/user/:email", async (req: Request, res: Response): Promise<any> => {
+    try {
+      const { email } = req.params;
+      if (!email) {
+        return res.status(400).json({
+          success: false,
+          message: "Email is required",
+        });
+      }
 
-          const result = await userCollection.findOne({
-            email: email,
-          });
+      if (!dbConnected || !userCollection) {
+        return res
+          .status(503)
+          .json({ success: false, message: "Database not available" });
+      }
 
-          return res.status(200).json({
-            success: true,
-            user: result,
-          });
-        } catch (error: any) {
-          console.error("Get User Error:", error);
+      const result = await userCollection.findOne({ email: email });
 
-          return res.status(500).json({
-            success: false,
-            message: error.message,
-          });
-        }
-      },
-    );
+      return res.status(200).json({
+        success: true,
+        user: result,
+      });
+    } catch (error: any) {
+      console.error("Get User Error:", error);
 
-    app.post("/scanner-data", async (req, res) => {
+      return res.status(500).json({
+        success: false,
+        message: error.message,
+      });
+    }
+  });
+
+  app.post("/scanner-data", async (req, res) => {
+    try {
+      const parsed = scanSchema.safeParse(req.body);
+
+      if (!parsed.success) {
+        return res.status(400).json({
+          success: false,
+          errors: parsed.error.flatten(),
+        });
+      }
+
+      const { type, value } = parsed.data;
+      const { userEmail } = req.body;
+
+      if (!userEmail) {
+        return res.status(400).json({
+          success: false,
+          message: "User email is required",
+        });
+      }
+
+      if (!dbConnected || !scanHistoryCollection) {
+        return res.status(503).json({
+          success: false,
+          message: "MongoDB is not connected. Scan result was not saved.",
+        });
+      }
+
+      // Run security checks
+      const googleResult = await checkUrlWithGoogle(value).catch(() => null);
+
+      const virusTotalResult = await checkUrlWithVirusTotal(value).catch(
+        () => ({
+          stats: {
+            malicious: 0,
+            suspicious: 0,
+            harmless: 0,
+            undetected: 0,
+          },
+          status: "unavailable",
+          analysisId: "",
+        }),
+      );
+
+      const { malicious, suspicious } = virusTotalResult.stats;
+      const googleMatches = Array.isArray((googleResult as any)?.matches)
+        ? (googleResult as any).matches.length
+        : 0;
+
+      // Evidence-based score
+      const evidenceScore = Math.min(
+        (malicious ? 70 : 0) + (suspicious ? 20 : 0) + (googleMatches ? 60 : 0),
+        100,
+      );
+
+      let aiResult = {
+        isScam: evidenceScore >= 50,
+        score: evidenceScore,
+        summary:
+          googleMatches && !malicious
+            ? "Security detection triggered by Google Safe Browsing."
+            : evidenceScore >= 50
+              ? "Potential security threat detected."
+              : "No major known threat detected.",
+        insights: [
+          `VirusTotal malicious: ${malicious}`,
+          `VirusTotal suspicious: ${suspicious}`,
+          googleMatches
+            ? "Google Safe Browsing detected a threat."
+            : "Google Safe Browsing found no known threat.",
+        ],
+      };
+
+      // Gemini (optional)
       try {
-        const result = scanSchema.safeParse(req.body);
-        if (!result.success) {
-          return res
-            .status(400)
-            .json({ success: false, errors: result.error.flatten() });
-        }
-
-        const { type, value } = result.data;
-        const { userEmail } = req.body;
-
-        if (!userEmail) {
-          return res.status(400).json({
-            success: false,
-            message: "User email is required",
-          });
-        }
-
-        const googleResult = await checkUrlWithGoogle(value);
-
-        // Optional: Keep VirusTotal call as requested in your snippet
-        await checkUrlWithVirusTotal(value).catch((err) =>
-          console.error("VirusTotal Error:", err),
-        );
-
-        let aiResult = {
-          isScam: false,
-          score: googleResult?.matches?.length ? 95 : 5,
-          summary: googleResult?.matches?.length
-            ? "Detected by Google Safe Browsing."
-            : "No known threats detected.",
-          insights: [
-            "Google Safe Browsing completed.",
-            "AI analysis unavailable.",
-          ],
-        };
-
-        try {
-          aiResult = await analyzeWithGemini(type, value, googleResult);
-        } catch (error) {
-          console.error("Gemini Error:", error);
-          aiResult.insights.push(
-            "Gemini quota exceeded. Using fallback analysis.",
-          );
-        }
-
-        await scanHistoryCollection.insertOne({
-          userEmail,
+        const gemini = await analyzeWithGemini(
           type,
           value,
-          score: aiResult.score,
-          isScam: aiResult.isScam,
-          summary: aiResult.summary,
-          insights: aiResult.insights,
-          createdAt: new Date(),
-        });
+          googleResult,
+          virusTotalResult,
+        );
 
-        return res.json(aiResult);
+        aiResult = {
+          isScam: aiResult.isScam || gemini.isScam,
+          score: Math.max(evidenceScore, gemini.score),
+          summary: aiResult.isScam ? aiResult.summary : gemini.summary,
+          insights: gemini.insights.slice(0, 3),
+        };
       } catch (error) {
-        console.error("Scanner Route Error:", error);
+        console.warn("Gemini unavailable, using evidence score.");
+      }
+
+      const scanDocument = {
+        userEmail,
+        type,
+        value,
+        score: aiResult.score,
+        isScam: aiResult.isScam,
+        summary: aiResult.summary,
+        insights: aiResult.insights,
+        createdAt: new Date(),
+      };
+
+      const inserted = await scanHistoryCollection.insertOne(scanDocument);
+
+      return res.status(200).json({
+        success: true,
+        ...aiResult,
+        scanId: inserted.insertedId.toString(),
+      });
+    } catch (error) {
+      console.error("Scanner Route Error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message:
+          error instanceof Error ? error.message : "Internal Server Error",
+      });
+    }
+  });
+  app.get(
+    "/scan-history/:email",
+    async (req: Request, res: Response): Promise<any> => {
+      try {
+        const { email } = req.params;
+
+        if (!email) {
+          return res.status(400).json({
+            success: false,
+            message: "Email is required",
+          });
+        }
+
+        if (!dbConnected || !scanHistoryCollection) {
+          return res
+            .status(503)
+            .json({ success: false, message: "Database not available" });
+        }
+
+        const history = await scanHistoryCollection
+          .find({ userEmail: email })
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        return res.status(200).json({
+          success: true,
+          history,
+        });
+      } catch (error) {
+        console.error("Scan History Error:", error);
+
         return res.status(500).json({
           success: false,
           message:
             error instanceof Error ? error.message : "Internal Server Error",
         });
       }
-    });
+    },
+  );
 
-    app.get(
-      "/scan-history/:email",
-      async (req: Request, res: Response): Promise<any> => {
-        try {
-          const { email } = req.params;
+  const server = app.listen(port, () => {
+    console.log(`ScamShield server running on port ${port}`);
+  });
 
-          if (!email) {
-            return res.status(400).json({
-              success: false,
-              message: "Email is required",
-            });
-          }
-
-          const history = await scanHistoryCollection
-            .find({ userEmail: email })
-            .sort({ createdAt: -1 })
-            .toArray();
-
-          return res.status(200).json({
-            success: true,
-            history,
-          });
-        } catch (error) {
-          console.error("Scan History Error:", error);
-
-          return res.status(500).json({
-            success: false,
-            message:
-              error instanceof Error ? error.message : "Internal Server Error",
-          });
-        }
-      },
-    );
-
-    const server = app.listen(port, () => {
-      console.log(`ScamShield server running on port ${port}`);
-    });
-
-    server.on("error", (err: NodeJS.ErrnoException) => {
-      if (err.code === "EADDRINUSE") {
-        const fallbackPort = port + 1;
-        console.warn(
-          `Port ${port} is already in use. Trying fallback port ${fallbackPort}...`,
-        );
-        app.listen(fallbackPort, () => {
-          console.log(`ScamShield server running on port ${fallbackPort}`);
-        });
-      } else {
-        console.error("Server error:", err);
-        process.exit(1);
-      }
-    });
-  } catch (error) {
-    console.error("MongoDB connection error:", error);
-  }
+  server.on("error", (err: NodeJS.ErrnoException) => {
+  
+      app.listen(port, () => {
+        console.log(`ScamShield server running on port ${port}`);
+      });
+   
+  });
 }
 
 run();
