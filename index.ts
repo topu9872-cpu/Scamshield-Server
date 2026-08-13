@@ -1,6 +1,11 @@
 import process from "node:process";
 import express, { type Request, type Response } from "express";
-import { MongoClient, ServerApiVersion } from "mongodb";
+import {
+  MongoClient,
+  ObjectId,
+  ServerApiVersion,
+  type Collection,
+} from "mongodb";
 import cors from "cors";
 import dotenv from "dotenv";
 import nodemailer from "nodemailer";
@@ -8,27 +13,19 @@ import { scanSchema } from "./scan.js";
 import { checkUrlWithGoogle } from "./googleSafeBrowsing.js";
 import { analyzeWithGemini } from "./gemini.js";
 import { checkUrlWithVirusTotal } from "./utils/virusTotal.js";
-const app = express();
+
 dotenv.config();
-app.use(cors());
-app.use(express.json());
+const app = express();
+app.use(cors(), express.json());
 
 const port = Number(process.env.PORT ?? 5000);
+const uri = process.env.MONGODB_URI;
+if (!uri) throw new Error("MONGODB_URI is required");
 
 const transporter = nodemailer.createTransport({
   service: "gmail",
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
+  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
 });
-
-const uri = process.env.MONGODB_URI;
-if (!uri) {
-  throw new Error("MONGODB_URI environment variable is required");
-}
-
-const dbName = (process.env.MONGODB_DB_NAME ?? "Scamshield").trim();
 
 const client = new MongoClient(uri, {
   serverApi: {
@@ -40,378 +37,320 @@ const client = new MongoClient(uri, {
   serverSelectionTimeoutMS: 10000,
 });
 
-let dbConnected = false;
-let userCollection: import("mongodb").Collection<User> | null = null;
-let scanHistoryCollection: import("mongodb").Collection<ScanHistory> | null =
-  null;
+let userCollection: Collection<any>;
+let scanHistoryCollection: Collection<any>;
 
-interface User {
-  email: string;
-  name?: string;
-  [key: string]: any;
-}
-interface ScanHistory {
-  userEmail: string;
-  type: "url" | "email" | "phone" | "text";
-  value: string;
-  score: number;
-  isScam: boolean;
-  summary: string;
-  insights: string[];
-  createdAt: Date;
-}
+// Helper for error responses
+const handleError = (
+  res: Response,
+  error: unknown,
+  message = "Internal Server Error",
+) => {
+  console.error(message, error);
+  return res
+    .status(500)
+    .json({
+      success: false,
+      message: error instanceof Error ? error.message : message,
+    });
+};
 
 async function run() {
-  // Try to connect to MongoDB but don't block server startup on failure
   try {
     await client.connect();
-
-    const db = client.db(dbName);
-
-    if (!process.env.MONGODB_DB_NAME) {
-      console.warn("MONGODB_DB_NAME not set, defaulting to 'Scamshield'");
-    }
-
-    userCollection = db.collection<User>("users");
-    scanHistoryCollection = db.collection<ScanHistory>("scan_history");
-
-    dbConnected = true;
+    const db = client.db(process.env.MONGODB_DB_NAME?.trim() || "Scamshield");
+    userCollection = db.collection("users");
+    scanHistoryCollection = db.collection("scan_history");
     console.log("MongoDB connected successfully");
   } catch (error) {
-    dbConnected = false;
     console.error("MongoDB connection error:", error);
   }
 
+  // --- USERS ---
   app.post("/user", async (req: Request, res: Response): Promise<any> => {
     try {
       const { name, email, password } = req.body;
-      if (!email) {
+      if (!email)
         return res
           .status(400)
-          .json({ success: false, message: " email is required" });
-      }
-
-      if (!dbConnected || !userCollection) {
+          .json({ success: false, message: "Email is required" });
+      if (!userCollection)
         return res
           .status(503)
           .json({ success: false, message: "Database not available" });
-      }
 
-      // Check existing user
-      const existingUser = await userCollection.findOne({ email });
-
-      if (existingUser) {
+      if (await userCollection.findOne({ email })) {
         return res
           .status(409)
           .json({ success: false, message: "User already exists" });
       }
 
-      const newUser = { name, email, password, createdAt: new Date() };
-
-      const result = await userCollection.insertOne(newUser);
-
-      return res.status(200).json({
-        success: true,
-        message: "User created successfully",
-        user: { id: result.insertedId, name, email },
+      const result = await userCollection.insertOne({
+        name,
+        email,
+        password,
+        createdAt: new Date(),
       });
-    } catch (error: any) {
-      console.error("Create User Error:", error);
-
-      return res.status(500).json({
-        success: false,
-        message: error.message,
-      });
+      return res
+        .status(200)
+        .json({
+          success: true,
+          message: "User created",
+          user: { id: result.insertedId, name, email },
+        });
+    } catch (error) {
+      return handleError(res, error, "Create User Error");
     }
   });
 
-  // Send Welcome Email
+  app.get("/user/:email", async (req: Request, res: Response): Promise<any> => {
+    try {
+      const { email } = req.params;
+      if (!email)
+        return res
+          .status(400)
+          .json({ success: false, message: "Email is required" });
+      if (!userCollection)
+        return res
+          .status(503)
+          .json({ success: false, message: "Database not available" });
 
+      const user = await userCollection.findOne({ email });
+      return res.status(200).json({ success: true, user });
+    } catch (error) {
+      return handleError(res, error, "Get User Error");
+    }
+  });
+
+  // --- EMAIL ---
   app.post("/send-email", async (req: Request, res: Response): Promise<any> => {
     try {
-      const { name, email } = req.body.data;
-
-      if (!email) {
-        return res.status(400).json({
-          success: false,
-          message: " email are required",
-        });
-      }
+      const { name, email } = req.body.data || req.body;
+      if (!email)
+        return res
+          .status(400)
+          .json({ success: false, message: "Email is required" });
 
       const mailOptions = {
         from: process.env.EMAIL_USER,
         to: email,
         subject: "Welcome to ScamShield",
         html: `
-              <div style="
-                font-family: Arial, sans-serif;
-                max-width: 600px;
-                margin: auto;
-                padding: 24px;
-                border: 1px solid #e5e5e5;
-                border-radius: 10px;
-              ">
-                <h2 style="color: #2563eb;">
-                  Welcome to ScamShield, ${name}! 🛡️
-                </h2>
+          <div style="
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: auto;
+            padding: 24px;
+            border: 1px solid #e5e5e5;
+            border-radius: 10px;
+          ">
+            <h2 style="color: #2563eb;">
+              Welcome to ScamShield, ${name}! 🛡️
+            </h2>
 
-                <p>
-                  Hi <strong>${name}</strong>,
-                </p>
+            <p>
+              Hi <strong>${name}</strong>,
+            </p>
 
-                <p>
-                  Thank you for joining <strong>ScamShield</strong>.
-                  Your account has been successfully created, and you're now
-                  part of a platform dedicated to helping users stay safe
-                  from online scams and cyber threats.
-                </p>
+            <p>
+              Thank you for joining <strong>ScamShield</strong>.
+              Your account has been successfully created, and you're now
+              part of a platform dedicated to helping users stay safe
+              from online scams and cyber threats.
+            </p>
 
-                <p>
-                  You can now sign in to your account and explore powerful
-                  security features designed to protect your digital experience.
-                </p>
+            <p>
+              You can now sign in to your account and explore powerful
+              security features designed to protect your digital experience.
+            </p>
 
-                <p>
-                  If you have any questions or need assistance,
-                  our support team is always here to help.
-                </p>
+            <p>
+              If you have any questions or need assistance,
+              our support team is always here to help.
+            </p>
 
-                <p>
-                  Stay safe,<br />
-                  <strong>The ScamShield Team</strong>
-                </p>
+            <p>
+              Stay safe,<br />
+              <strong>The ScamShield Team</strong>
+            </p>
 
-                <hr style="margin: 24px 0;" />
+            <hr style="margin: 24px 0;" />
 
-                <p style="font-size: 12px; color: #666;">
-                  This is an automated email.
-                  Please do not reply to this message.
-                </p>
-              </div>
-            `,
+            <p style="font-size: 12px; color: #666;">
+              This is an automated email.
+              Please do not reply to this message.
+            </p>
+          </div>
+        `,
       };
 
       await transporter.sendMail(mailOptions);
 
-      return res.status(200).json({
-        success: true,
-        message: "Welcome email sent successfully",
-      });
-    } catch (error: any) {
-      console.error("Mail Error:", error);
-
-      return res.status(500).json({
-        success: false,
-        message: error.message,
-      });
-    }
-  });
-  // =========================
-  // Get User By Email
-  // =========================
-  app.get("/user/:email", async (req: Request, res: Response): Promise<any> => {
-    try {
-      const { email } = req.params;
-      if (!email) {
-        return res.status(400).json({
-          success: false,
-          message: "Email is required",
-        });
-      }
-
-      if (!dbConnected || !userCollection) {
-        return res
-          .status(503)
-          .json({ success: false, message: "Database not available" });
-      }
-
-      const result = await userCollection.findOne({ email: email });
-
-      return res.status(200).json({
-        success: true,
-        user: result,
-      });
-    } catch (error: any) {
-      console.error("Get User Error:", error);
-
-      return res.status(500).json({
-        success: false,
-        message: error.message,
-      });
+      return res
+        .status(200)
+        .json({ success: true, message: "Welcome email sent successfully" });
+    } catch (error) {
+      return handleError(res, error, "Mail Error");
     }
   });
 
-  app.post("/scanner-data", async (req, res) => {
-    try {
-      const parsed = scanSchema.safeParse(req.body);
-
-      if (!parsed.success) {
-        return res.status(400).json({
-          success: false,
-          errors: parsed.error.flatten(),
-        });
-      }
-
-      const { type, value } = parsed.data;
-      const { userEmail } = req.body;
-
-      if (!userEmail) {
-        return res.status(400).json({
-          success: false,
-          message: "User email is required",
-        });
-      }
-
-      if (!dbConnected || !scanHistoryCollection) {
-        return res.status(503).json({
-          success: false,
-          message: "MongoDB is not connected. Scan result was not saved.",
-        });
-      }
-
-      // Run security checks
-      const googleResult = await checkUrlWithGoogle(value).catch(() => null);
-
-      const virusTotalResult = await checkUrlWithVirusTotal(value).catch(
-        () => ({
-          stats: {
-            malicious: 0,
-            suspicious: 0,
-            harmless: 0,
-            undetected: 0,
-          },
-          status: "unavailable",
-          analysisId: "",
-        }),
-      );
-
-      const { malicious, suspicious } = virusTotalResult.stats;
-      const googleMatches = Array.isArray((googleResult as any)?.matches)
-        ? (googleResult as any).matches.length
-        : 0;
-
-      // Evidence-based score
-      const evidenceScore = Math.min(
-        (malicious ? 70 : 0) + (suspicious ? 20 : 0) + (googleMatches ? 60 : 0),
-        100,
-      );
-
-      let aiResult = {
-        isScam: evidenceScore >= 50,
-        score: evidenceScore,
-        summary:
-          googleMatches && !malicious
-            ? "Security detection triggered by Google Safe Browsing."
-            : evidenceScore >= 50
-              ? "Potential security threat detected."
-              : "No major known threat detected.",
-        insights: [
-          `VirusTotal malicious: ${malicious}`,
-          `VirusTotal suspicious: ${suspicious}`,
-          googleMatches
-            ? "Google Safe Browsing detected a threat."
-            : "Google Safe Browsing found no known threat.",
-        ],
-      };
-
-      // Gemini (optional)
+  // --- SCANNER ---
+  app.post(
+    "/scanner-data",
+    async (req: Request, res: Response): Promise<any> => {
       try {
-        const gemini = await analyzeWithGemini(
-          type,
-          value,
-          googleResult,
-          virusTotalResult,
+        const parsed = scanSchema.safeParse(req.body);
+        if (!parsed.success)
+          return res
+            .status(400)
+            .json({ success: false, errors: parsed.error.flatten() });
+
+        const { type, value } = parsed.data;
+        const { userEmail } = req.body;
+        if (!userEmail)
+          return res
+            .status(400)
+            .json({ success: false, message: "User email is required" });
+        if (!scanHistoryCollection)
+          return res
+            .status(503)
+            .json({ success: false, message: "Database not available" });
+
+        const [googleResult, virusTotalResult] = await Promise.all([
+          checkUrlWithGoogle(value).catch(() => null),
+          checkUrlWithVirusTotal(value).catch(() => ({
+            stats: { malicious: 0, suspicious: 0 },
+          })),
+        ]);
+
+        const malicious = virusTotalResult.stats.malicious || 0;
+        const suspicious = virusTotalResult.stats.suspicious || 0;
+        const googleMatches = Array.isArray((googleResult as any)?.matches)
+          ? (googleResult as any).matches.length
+          : 0;
+
+        const evidenceScore = Math.min(
+          (malicious ? 70 : 0) +
+            (suspicious ? 20 : 0) +
+            (googleMatches ? 60 : 0),
+          100,
         );
 
-        aiResult = {
-          isScam: aiResult.isScam || gemini.isScam,
-          score: Math.max(evidenceScore, gemini.score),
-          summary: aiResult.isScam ? aiResult.summary : gemini.summary,
-          insights: gemini.insights.slice(0, 3),
+        let aiResult = {
+          isScam: evidenceScore >= 50,
+          score: evidenceScore,
+          summary:
+            googleMatches && !malicious
+              ? "Google Safe Browsing detection."
+              : evidenceScore >= 50
+                ? "Potential threat detected."
+                : "No threat detected.",
+          insights: [
+            `VirusTotal malicious: ${malicious}`,
+            `VirusTotal suspicious: ${suspicious}`,
+            googleMatches
+              ? "Google Safe Browsing detected a threat."
+              : "Google Safe Browsing found no threat.",
+          ],
         };
+
+        try {
+          const gemini = await analyzeWithGemini(
+            type,
+            value,
+            googleResult,
+            virusTotalResult,
+          );
+          aiResult = {
+            isScam: aiResult.isScam || gemini.isScam,
+            score: Math.max(evidenceScore, gemini.score),
+            summary: aiResult.isScam ? aiResult.summary : gemini.summary,
+            insights: gemini.insights.slice(0, 3),
+          };
+        } catch {
+          console.warn("Gemini unavailable, using evidence score.");
+        }
+
+        const scanDocument = {
+          userEmail,
+          type,
+          value,
+          ...aiResult,
+          createdAt: new Date(),
+        };
+        const inserted = await scanHistoryCollection.insertOne(scanDocument);
+
+        return res
+          .status(200)
+          .json({
+            success: true,
+            ...aiResult,
+            scanId: inserted.insertedId.toString(),
+          });
       } catch (error) {
-        console.warn("Gemini unavailable, using evidence score.");
+        return handleError(res, error, "Scanner Route Error");
       }
+    },
+  );
 
-      const scanDocument = {
-        userEmail,
-        type,
-        value,
-        score: aiResult.score,
-        isScam: aiResult.isScam,
-        summary: aiResult.summary,
-        insights: aiResult.insights,
-        createdAt: new Date(),
-      };
-
-      const inserted = await scanHistoryCollection.insertOne(scanDocument);
-
-      return res.status(200).json({
-        success: true,
-        ...aiResult,
-        scanId: inserted.insertedId.toString(),
-      });
-    } catch (error) {
-      console.error("Scanner Route Error:", error);
-
-      return res.status(500).json({
-        success: false,
-        message:
-          error instanceof Error ? error.message : "Internal Server Error",
-      });
-    }
-  });
+  // --- SCAN HISTORY ---
   app.get(
     "/scan-history/:email",
     async (req: Request, res: Response): Promise<any> => {
       try {
         const { email } = req.params;
-
-        if (!email) {
-          return res.status(400).json({
-            success: false,
-            message: "Email is required",
-          });
-        }
-
-        if (!dbConnected || !scanHistoryCollection) {
+        if (!email)
+          return res
+            .status(400)
+            .json({ success: false, message: "Email is required" });
+        if (!scanHistoryCollection)
           return res
             .status(503)
             .json({ success: false, message: "Database not available" });
-        }
 
         const history = await scanHistoryCollection
           .find({ userEmail: email })
           .sort({ createdAt: -1 })
           .toArray();
-
-        return res.status(200).json({
-          success: true,
-          history,
-        });
+        return res.status(200).json({ success: true, history });
       } catch (error) {
-        console.error("Scan History Error:", error);
-
-        return res.status(500).json({
-          success: false,
-          message:
-            error instanceof Error ? error.message : "Internal Server Error",
-        });
+        return handleError(res, error, "Scan History Error");
       }
     },
   );
 
-  const server = app.listen(port, () => {
-    console.log(`ScamShield server running on port ${port}`);
-  });
+  app.delete(
+    "/scan-history/:id",
+    async (req: Request, res: Response): Promise<any> => {
+      try {
+        const id = Array.isArray(req.params.id)
+          ? req.params.id[0]
+          : req.params.id;
+        if (!id || !ObjectId.isValid(id))
+          return res
+            .status(400)
+            .json({ success: false, message: "Invalid ID" });
+        if (!scanHistoryCollection)
+          return res
+            .status(503)
+            .json({ success: false, message: "Database not available" });
 
-  server.on("error", (err: NodeJS.ErrnoException) => {
-  
-      app.listen(port, () => {
-        console.log(`ScamShield server running on port ${port}`);
-      });
-   
-  });
+        const result = await scanHistoryCollection.deleteOne({
+          _id: new ObjectId(id),
+        });
+       console.log(result)
+        return res
+          .status(200)
+          .json({ success: true, message: "Deleted successfully", result });
+      } catch (error) {
+        return handleError(res, error, "Delete Error");
+      }
+    },
+  );
+
+  app.listen(port, () =>
+    console.log(`ScamShield server running on port ${port}`),
+  );
 }
 
 run();
