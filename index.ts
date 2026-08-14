@@ -12,6 +12,7 @@ import nodemailer from "nodemailer";
 import { scanSchema } from "./scan.js";
 import { checkUrlWithGoogle } from "./googleSafeBrowsing.js";
 import { analyzeWithGemini } from "./gemini.js";
+import { scoreUrlRisk } from "./riskScoring.js";
 import { checkUrlWithVirusTotal } from "./utils/virusTotal.js";
 
 dotenv.config();
@@ -47,12 +48,10 @@ const handleError = (
   message = "Internal Server Error",
 ) => {
   console.error(message, error);
-  return res
-    .status(500)
-    .json({
-      success: false,
-      message: error instanceof Error ? error.message : message,
-    });
+  return res.status(500).json({
+    success: false,
+    message: error instanceof Error ? error.message : message,
+  });
 };
 
 async function run() {
@@ -91,13 +90,11 @@ async function run() {
         password,
         createdAt: new Date(),
       });
-      return res
-        .status(200)
-        .json({
-          success: true,
-          message: "User created",
-          user: { id: result.insertedId, name, email },
-        });
+      return res.status(200).json({
+        success: true,
+        message: "User created",
+        user: { id: result.insertedId, name, email },
+      });
     } catch (error) {
       return handleError(res, error, "Create User Error");
     }
@@ -200,59 +197,103 @@ async function run() {
     async (req: Request, res: Response): Promise<any> => {
       try {
         const parsed = scanSchema.safeParse(req.body);
-        if (!parsed.success)
-          return res
-            .status(400)
-            .json({ success: false, errors: parsed.error.flatten() });
+
+        if (!parsed.success) {
+          return res.status(400).json({
+            success: false,
+            errors: parsed.error.flatten(),
+          });
+        }
 
         const { type, value } = parsed.data;
         const { userEmail } = req.body;
-        if (!userEmail)
-          return res
-            .status(400)
-            .json({ success: false, message: "User email is required" });
-        if (!scanHistoryCollection)
-          return res
-            .status(503)
-            .json({ success: false, message: "Database not available" });
 
-        const [googleResult, virusTotalResult] = await Promise.all([
-          checkUrlWithGoogle(value).catch(() => null),
-          checkUrlWithVirusTotal(value).catch(() => ({
-            stats: { malicious: 0, suspicious: 0 },
-          })),
-        ]);
+        if (!userEmail) {
+          return res.status(400).json({
+            success: false,
+            message: "User email is required",
+          });
+        }
 
-        const malicious = virusTotalResult.stats.malicious || 0;
-        const suspicious = virusTotalResult.stats.suspicious || 0;
-        const googleMatches = Array.isArray((googleResult as any)?.matches)
-          ? (googleResult as any).matches.length
-          : 0;
+        if (!scanHistoryCollection) {
+          return res.status(503).json({
+            success: false,
+            message: "Database not available",
+          });
+        }
 
-        const evidenceScore = Math.min(
-          (malicious ? 70 : 0) +
-            (suspicious ? 20 : 0) +
-            (googleMatches ? 60 : 0),
-          100,
-        );
+        let googleResult: unknown = null;
+        let virusTotalResult: unknown = null;
 
-        let aiResult = {
-          isScam: evidenceScore >= 50,
-          score: evidenceScore,
+        let malicious = 0;
+        let suspicious = 0;
+        let googleMatches = 0;
+
+        // ==========================================
+        // URL ONLY
+        // ==========================================
+
+        if (type === "url") {
+          const [googleResponse, virusTotalResponse] = await Promise.all([
+            checkUrlWithGoogle(value).catch((error) => {
+              console.error("Google Safe Browsing error:", error);
+              return null;
+            }),
+
+            checkUrlWithVirusTotal(value).catch((error) => {
+              console.error("VirusTotal error:", error);
+
+              return {
+                stats: {
+                  malicious: 0,
+                  suspicious: 0,
+                },
+              };
+            }),
+          ]);
+
+          googleResult = googleResponse;
+          virusTotalResult = virusTotalResponse;
+
+          malicious =
+            Number((virusTotalResponse as any)?.stats?.malicious) || 0;
+
+          suspicious =
+            Number((virusTotalResponse as any)?.stats?.suspicious) || 0;
+
+          googleMatches = Array.isArray((googleResponse as any)?.matches)
+            ? (googleResponse as any).matches.length
+            : 0;
+        }
+
+        // ==========================================
+        // URL EVIDENCE SCORE
+        // ==========================================
+
+        const evidenceScore =
+          type === "url"
+            ? scoreUrlRisk(type, value, malicious, suspicious, googleMatches)
+            : 0;
+
+        const buildFallbackResult = () => ({
+          isScam: evidenceScore >= 60,
+          score: Math.max(0, Math.min(100, evidenceScore)),
           summary:
-            googleMatches && !malicious
-              ? "Google Safe Browsing detection."
-              : evidenceScore >= 50
-                ? "Potential threat detected."
-                : "No threat detected.",
+            evidenceScore >= 60
+              ? "Potential phishing or scam pattern detected."
+              : evidenceScore >= 40
+                ? "Suspicious behavior detected."
+                : "No known threat detected.",
           insights: [
             `VirusTotal malicious: ${malicious}`,
             `VirusTotal suspicious: ${suspicious}`,
-            googleMatches
+            googleMatches > 0
               ? "Google Safe Browsing detected a threat."
-              : "Google Safe Browsing found no threat.",
+              : "Google Safe Browsing found no known threat.",
           ],
-        };
+        });
+
+        let aiResult = buildFallbackResult();
 
         try {
           const gemini = await analyzeWithGemini(
@@ -261,44 +302,80 @@ async function run() {
             googleResult,
             virusTotalResult,
           );
+
+          console.log("GEMINI RESULT:", gemini);
+
           aiResult = {
-            isScam: aiResult.isScam || gemini.isScam,
-            score: Math.max(evidenceScore, gemini.score),
-            summary: aiResult.isScam ? aiResult.summary : gemini.summary,
-            insights: gemini.insights.slice(0, 3),
+            isScam: gemini.isScam || evidenceScore >= 60,
+            score: Math.max(
+              evidenceScore,
+              Math.max(0, Math.min(100, Math.round(gemini.score))),
+            ),
+            summary: gemini.summary || aiResult.summary,
+            insights: gemini.insights.map(String).slice(0, 3),
           };
-        } catch {
-          console.warn("Gemini unavailable, using evidence score.");
+        } catch (error) {
+          console.error("GEMINI FAILED:", error);
+          aiResult = buildFallbackResult();
+          aiResult.isScam = aiResult.isScam || evidenceScore >= 60;
+          aiResult.score = Math.max(aiResult.score, evidenceScore);
         }
+        // ==========================================
+        // FINAL DOCUMENT
+        // ==========================================
 
         const scanDocument = {
           userEmail,
           type,
           value,
-          ...aiResult,
+
+          isScam: aiResult.isScam,
+
+          score: Math.max(0, Math.min(100, Math.round(aiResult.score))),
+
+          summary: aiResult.summary,
+
+          insights: aiResult.insights,
+
           createdAt: new Date(),
         };
-        const inserted = await scanHistoryCollection.insertOne(scanDocument);
 
-        return res
-          .status(200)
-          .json({
-            success: true,
-            ...aiResult,
-            scanId: inserted.insertedId.toString(),
-          });
+        let scanId = null;
+
+        try {
+          const inserted = await scanHistoryCollection.insertOne(scanDocument);
+          scanId = inserted.insertedId.toString();
+        } catch (dbError) {
+          console.error("Failed to save scan history:", dbError);
+        }
+
+        return res.status(200).json({
+          success: true,
+
+          isScam: scanDocument.isScam,
+
+          score: scanDocument.score,
+
+          summary: scanDocument.summary,
+
+          insights: scanDocument.insights,
+
+          scanId,
+        });
       } catch (error) {
         return handleError(res, error, "Scanner Route Error");
       }
     },
   );
-
   // --- SCAN HISTORY ---
   app.get(
     "/scan-history/:email",
     async (req: Request, res: Response): Promise<any> => {
       try {
         const { email } = req.params;
+        const page = Math.max(1, Number(req.query.page ?? 1));
+        const limit = Math.min(50, Math.max(1, Number(req.query.limit ?? 8)));
+
         if (!email)
           return res
             .status(400)
@@ -308,11 +385,26 @@ async function run() {
             .status(503)
             .json({ success: false, message: "Database not available" });
 
-        const history = await scanHistoryCollection
-          .find({ userEmail: email })
-          .sort({ createdAt: -1 })
-          .toArray();
-        return res.status(200).json({ success: true, history });
+        const skip = (page - 1) * limit;
+
+        const [history, total] = await Promise.all([
+          scanHistoryCollection
+            .find({ userEmail: email })
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .toArray(),
+          scanHistoryCollection.countDocuments({ userEmail: email }),
+        ]);
+
+        return res.status(200).json({
+          success: true,
+          history,
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        });
       } catch (error) {
         return handleError(res, error, "Scan History Error");
       }
@@ -338,7 +430,7 @@ async function run() {
         const result = await scanHistoryCollection.deleteOne({
           _id: new ObjectId(id),
         });
-       console.log(result)
+        console.log(result);
         return res
           .status(200)
           .json({ success: true, message: "Deleted successfully", result });
