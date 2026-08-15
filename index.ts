@@ -12,8 +12,8 @@ import nodemailer from "nodemailer";
 import { scanSchema } from "./scan.js";
 import { checkUrlWithGoogle } from "./googleSafeBrowsing.js";
 import { analyzeWithGemini } from "./gemini.js";
-import { scoreUrlRisk } from "./riskScoring.js";
 import { checkUrlWithVirusTotal } from "./utils/virusTotal.js";
+import { scorePhoneRisk, scoreUrlRisk, scoreTextRisk } from "./riskScoring.js";
 
 dotenv.config();
 const app = express();
@@ -40,6 +40,7 @@ const client = new MongoClient(uri, {
 
 let userCollection: Collection<any>;
 let scanHistoryCollection: Collection<any>;
+let blacklistedPhonesCollection: Collection<any>;
 
 // Helper for error responses
 const handleError = (
@@ -57,9 +58,13 @@ const handleError = (
 async function run() {
   try {
     await client.connect();
+
     const db = client.db(process.env.MONGODB_DB_NAME?.trim() || "Scamshield");
+
     userCollection = db.collection("users");
     scanHistoryCollection = db.collection("scan_history");
+    blacklistedPhonesCollection = db.collection("blacklisted_phones");
+
     console.log("MongoDB connected successfully");
   } catch (error) {
     console.error("MongoDB connection error:", error);
@@ -191,11 +196,14 @@ async function run() {
     }
   });
 
-  // --- SCANNER ---
   app.post(
     "/scanner-data",
     async (req: Request, res: Response): Promise<any> => {
       try {
+        // ==========================================
+        // VALIDATION
+        // ==========================================
+
         const parsed = scanSchema.safeParse(req.body);
 
         if (!parsed.success) {
@@ -206,7 +214,7 @@ async function run() {
         }
 
         const { type, value } = parsed.data;
-        const { userEmail } = req.body;
+        const { userEmail, context = "" } = req.body;
 
         if (!userEmail) {
           return res.status(400).json({
@@ -222,78 +230,168 @@ async function run() {
           });
         }
 
-        let googleResult: unknown = null;
-        let virusTotalResult: unknown = null;
+        // ==========================================
+        // THREAT INTELLIGENCE
+        // ==========================================
+
+        let googleResult: any = null;
+        let virusTotalResult: any = null;
 
         let malicious = 0;
         let suspicious = 0;
         let googleMatches = 0;
+        let isKnownScam = false;
 
         // ==========================================
-        // URL ONLY
+        // URL CHECK
         // ==========================================
 
         if (type === "url") {
           const [googleResponse, virusTotalResponse] = await Promise.all([
             checkUrlWithGoogle(value).catch((error) => {
               console.error("Google Safe Browsing error:", error);
-              return null;
+
+              return {
+                matches: [],
+              };
             }),
 
-            checkUrlWithVirusTotal(value).catch((error) => {
+            checkUrlWithVirusTotal(value).catch((error: unknown) => {
               console.error("VirusTotal error:", error);
 
               return {
                 stats: {
                   malicious: 0,
                   suspicious: 0,
+                  harmless: 0,
+                  undetected: 0,
                 },
+                status: "failed",
+                analysisId: "",
               };
             }),
           ]);
 
-          googleResult = googleResponse;
-          virusTotalResult = virusTotalResponse;
+         googleResult = googleResponse ?? { matches: [] };
+virusTotalResult = virusTotalResponse ?? { 
+  stats: { malicious: 0, suspicious: 0, harmless: 0, undetected: 0 } 
+};
 
-          malicious =
-            Number((virusTotalResponse as any)?.stats?.malicious) || 0;
+malicious = Number(virusTotalResult.stats?.malicious ?? 0);
+suspicious = Number(virusTotalResult.stats?.suspicious ?? 0);
 
-          suspicious =
-            Number((virusTotalResponse as any)?.stats?.suspicious) || 0;
-
-          googleMatches = Array.isArray((googleResponse as any)?.matches)
-            ? (googleResponse as any).matches.length
-            : 0;
+googleMatches = Array.isArray(googleResult.matches)
+  ? googleResult.matches.length
+  : 0;
         }
 
         // ==========================================
-        // URL EVIDENCE SCORE
+        // PHONE BLACKLIST
         // ==========================================
 
-        const evidenceScore =
-          type === "url"
-            ? scoreUrlRisk(type, value, malicious, suspicious, googleMatches)
-            : 0;
+        if (type === "phone" && blacklistedPhonesCollection) {
+          const cleanPhone = value.replace(/\D/g, "");
 
-        const buildFallbackResult = () => ({
+          try {
+            const blacklistedEntry = await blacklistedPhonesCollection.findOne({
+              phone: cleanPhone,
+            });
+
+            isKnownScam = Boolean(blacklistedEntry);
+          } catch (error) {
+            console.error("Phone blacklist error:", error);
+          }
+        }
+
+        // ==========================================
+        // LOCAL RISK SCORE
+        // ==========================================
+
+        let evidenceScore = 0;
+
+        if (type === "url") {
+          evidenceScore = scoreUrlRisk(
+            type,
+            value,
+            malicious,
+            suspicious,
+            googleMatches,
+          );
+        }
+
+        if (type === "phone") {
+          evidenceScore = scorePhoneRisk(
+            type,
+            value,
+            malicious,
+            suspicious,
+            context,
+          );
+
+          // Database blacklist is strong evidence
+          if (isKnownScam) {
+            evidenceScore = Math.max(evidenceScore, 80);
+          }
+        }
+
+        if (type === "text") {
+          evidenceScore = scoreTextRisk(type, value, malicious, suspicious);
+        }
+
+        console.log("================================");
+        console.log("LOCAL RISK ANALYSIS");
+        console.log("Type:", type);
+        console.log("Value:", value);
+        console.log("Context:", context || "None");
+        console.log("Known scam:", isKnownScam);
+        console.log("Malicious:", malicious);
+        console.log("Suspicious:", suspicious);
+        console.log("Google matches:", googleMatches);
+        console.log("Evidence score:", evidenceScore);
+        console.log("================================");
+
+        // ==========================================
+        // FALLBACK
+        // ==========================================
+
+        const fallbackResult = {
           isScam: evidenceScore >= 60,
-          score: Math.max(0, Math.min(100, evidenceScore)),
-          summary:
-            evidenceScore >= 60
-              ? "Potential phishing or scam pattern detected."
-              : evidenceScore >= 40
-                ? "Suspicious behavior detected."
-                : "No known threat detected.",
-          insights: [
-            `VirusTotal malicious: ${malicious}`,
-            `VirusTotal suspicious: ${suspicious}`,
-            googleMatches > 0
-              ? "Google Safe Browsing detected a threat."
-              : "Google Safe Browsing found no known threat.",
-          ],
-        });
 
-        let aiResult = buildFallbackResult();
+          score: evidenceScore,
+
+          summary:
+            evidenceScore >= 80
+              ? "High-risk scam or malicious behavior detected."
+              : evidenceScore >= 60
+                ? "Potential scam or phishing behavior detected."
+                : evidenceScore >= 40
+                  ? "Some suspicious indicators were detected."
+                  : "No strong scam indicators were detected.",
+
+          insights: [
+            `Local risk analysis score: ${evidenceScore}%`,
+
+            type === "url"
+              ? `VirusTotal malicious: ${malicious}, suspicious: ${suspicious}`
+              : type === "phone"
+                ? isKnownScam
+                  ? "This phone number matched a known threat record."
+                  : "No known threat record was found for this phone number."
+                : "Behavioral analysis was used for this message.",
+
+            type === "url"
+              ? googleMatches > 0
+                ? "Google Safe Browsing detected a known threat."
+                : "Google Safe Browsing found no known threat."
+              : "Contextual analysis was used.",
+          ],
+        };
+
+        // ==========================================
+        // GEMINI
+        // ==========================================
+
+        let finalResult = fallbackResult;
 
         try {
           const gemini = await analyzeWithGemini(
@@ -301,65 +399,92 @@ async function run() {
             value,
             googleResult,
             virusTotalResult,
+            context,
           );
 
           console.log("GEMINI RESULT:", gemini);
 
-          aiResult = {
-            isScam: gemini.isScam || evidenceScore >= 60,
-            score: Math.max(
-              evidenceScore,
-              Math.max(0, Math.min(100, Math.round(gemini.score))),
-            ),
-            summary: gemini.summary || aiResult.summary,
-            insights: gemini.insights.map(String).slice(0, 3),
+          const geminiScore = Math.max(
+            0,
+            Math.min(100, Math.round(Number(gemini.score) || 0)),
+          );
+
+          const finalScore = Math.max(evidenceScore, geminiScore);
+
+          finalResult = {
+            isScam: finalScore >= 60,
+            score: finalScore,
+
+            summary: gemini.summary || fallbackResult.summary,
+
+            insights:
+              Array.isArray(gemini.insights) && gemini.insights.length
+                ? gemini.insights.map(String).slice(0, 3)
+                : fallbackResult.insights,
           };
+
+          console.log("================================");
+          console.log("GEMINI SCORE:", geminiScore);
+          console.log("LOCAL SCORE:", evidenceScore);
+          console.log("FINAL SCORE:", finalScore);
+          console.log("FINAL IS SCAM:", finalScore >= 60);
+          console.log("================================");
         } catch (error) {
           console.error("GEMINI FAILED:", error);
-          aiResult = buildFallbackResult();
-          aiResult.isScam = aiResult.isScam || evidenceScore >= 60;
-          aiResult.score = Math.max(aiResult.score, evidenceScore);
         }
+
         // ==========================================
         // FINAL DOCUMENT
         // ==========================================
+
+        const finalScore = Math.max(
+          0,
+          Math.min(100, Math.round(finalResult.score)),
+        );
 
         const scanDocument = {
           userEmail,
           type,
           value,
 
-          isScam: aiResult.isScam,
+          ...(type === "phone" && {
+            context,
+          }),
 
-          score: Math.max(0, Math.min(100, Math.round(aiResult.score))),
+          isScam: finalScore >= 60,
+          score: finalScore,
 
-          summary: aiResult.summary,
+          summary: finalResult.summary,
 
-          insights: aiResult.insights,
+          insights: finalResult.insights.map(String).slice(0, 3),
 
           createdAt: new Date(),
         };
 
-        let scanId = null;
+        // ==========================================
+        // SAVE HISTORY
+        // ==========================================
+
+        let scanId: string | null = null;
 
         try {
           const inserted = await scanHistoryCollection.insertOne(scanDocument);
+
           scanId = inserted.insertedId.toString();
-        } catch (dbError) {
-          console.error("Failed to save scan history:", dbError);
+        } catch (error) {
+          console.error("Failed to save scan history:", error);
         }
+
+        // ==========================================
+        // RESPONSE
+        // ==========================================
 
         return res.status(200).json({
           success: true,
-
           isScam: scanDocument.isScam,
-
           score: scanDocument.score,
-
           summary: scanDocument.summary,
-
           insights: scanDocument.insights,
-
           scanId,
         });
       } catch (error) {
@@ -375,6 +500,12 @@ async function run() {
         const { email } = req.params;
         const page = Math.max(1, Number(req.query.page ?? 1));
         const limit = Math.min(50, Math.max(1, Number(req.query.limit ?? 8)));
+        
+        // Extract query params sent by the frontend
+        const sortBy = (req.query.sortBy as string) || "createdAt";
+        const sortOrder = (req.query.sortOrder as string) === "asc" ? 1 : -1;
+        const search = (req.query.search as string) || "";
+        const filter = (req.query.filter as string) || "All";
 
         if (!email)
           return res
@@ -385,16 +516,36 @@ async function run() {
             .status(503)
             .json({ success: false, message: "Database not available" });
 
+        // Build query filter
+        const query: any = { userEmail: email };
+
+        if (search) {
+          query.$or = [
+            { value: { $regex: search, $options: "i" } },
+            { type: { $regex: search, $options: "i" } },
+          ];
+        }
+
+        if (filter !== "All") {
+          if (filter === "Safe") query.score = { $lte: 40 };
+          else if (filter === "Suspicious") query.score = { $gt: 40, $lte: 70 };
+          else if (filter === "Scam Detected") query.isScam = true;
+        }
+
+        // Build dynamic sort object
+        const sortQuery: Record<string, 1 | -1> = {};
+        sortQuery[sortBy] = sortOrder;
+
         const skip = (page - 1) * limit;
 
         const [history, total] = await Promise.all([
           scanHistoryCollection
-            .find({ userEmail: email })
-            .sort({ createdAt: -1 })
+            .find(query)
+            .sort(sortQuery)
             .skip(skip)
             .limit(limit)
             .toArray(),
-          scanHistoryCollection.countDocuments({ userEmail: email }),
+          scanHistoryCollection.countDocuments(query),
         ]);
 
         return res.status(200).json({

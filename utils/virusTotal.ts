@@ -23,7 +23,7 @@ const sleep = (ms: number) =>
 
 /**
  * VirusTotal URL identifier
- * Base64 URL-safe encoding without "=" padding.
+ * Base64 URL-safe encoding without '=' padding.
  */
 const getUrlId = (url: string) => {
   return Buffer.from(url)
@@ -42,10 +42,6 @@ export const checkUrlWithVirusTotal = async (
     throw new Error("VIRUSTOTAL_API_KEY is missing");
   }
 
-  // --------------------------------
-  // 1. Validate URL
-  // --------------------------------
-
   let parsedUrl: URL;
 
   try {
@@ -63,21 +59,12 @@ export const checkUrlWithVirusTotal = async (
   }
 
   const normalizedUrl = parsedUrl.toString();
-
-  console.log("VirusTotal checking:", normalizedUrl);
-
   const headers = {
     "x-apikey": apiKey,
     Accept: "application/json",
   };
 
-  // --------------------------------
-  // 2. Check existing URL report
-  // --------------------------------
-
   const urlId = getUrlId(normalizedUrl);
-
-  console.log("VirusTotal URL ID:", urlId);
 
   const existingResponse = await fetch(
     `https://www.virustotal.com/api/v3/urls/${urlId}`,
@@ -89,12 +76,8 @@ export const checkUrlWithVirusTotal = async (
 
   if (existingResponse.ok) {
     const existingData = await existingResponse.json();
-
     const stats =
-      existingData?.data?.attributes?.last_analysis_stats ??
-      EMPTY_STATS;
-
-    console.log("VirusTotal existing report:", stats);
+      existingData?.data?.attributes?.last_analysis_stats ?? EMPTY_STATS;
 
     return {
       stats: {
@@ -108,65 +91,30 @@ export const checkUrlWithVirusTotal = async (
     };
   }
 
-  console.log(
-    "VirusTotal existing report not found. Submitting new scan...",
-  );
-
-  // --------------------------------
-  // 3. Submit new URL scan
-  // --------------------------------
-
   const formData = new URLSearchParams();
-
   formData.append("url", normalizedUrl);
 
-  const submitResponse = await fetch(
-    "https://www.virustotal.com/api/v3/urls",
-    {
-      method: "POST",
-      headers: {
-        "x-apikey": apiKey,
-        Accept: "application/json",
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: formData.toString(),
+  const submitResponse = await fetch("https://www.virustotal.com/api/v3/urls", {
+    method: "POST",
+    headers: {
+      "x-apikey": apiKey,
+      Accept: "application/json",
+      "Content-Type": "application/x-www-form-urlencoded",
     },
-  );
+    body: formData.toString(),
+  });
 
   const submitData = await submitResponse.json();
 
-  console.log(
-    "VirusTotal submit status:",
-    submitResponse.status,
-  );
-
   if (!submitResponse.ok) {
-    console.error(
-      "VirusTotal submit error:",
-      submitData,
-    );
-
-    throw new Error(
-      `VirusTotal request failed: ${submitResponse.status}`,
-    );
+    throw new Error(`VirusTotal request failed: ${submitResponse.status}`);
   }
 
   const analysisId = submitData?.data?.id;
 
   if (!analysisId) {
-    throw new Error(
-      "VirusTotal analysis ID not found",
-    );
+    throw new Error("VirusTotal analysis ID not found");
   }
-
-  console.log(
-    "VirusTotal analysis ID:",
-    analysisId,
-  );
-
-  // --------------------------------
-  // 4. Poll analysis status
-  // --------------------------------
 
   const maxAttempts = 12;
 
@@ -181,42 +129,16 @@ export const checkUrlWithVirusTotal = async (
       },
     );
 
-    const analysisData =
-      await analysisResponse.json();
+    const analysisData = await analysisResponse.json();
 
     if (!analysisResponse.ok) {
-      console.error(
-        "VirusTotal analysis error:",
-        analysisData,
-      );
-
-      throw new Error(
-        `VirusTotal analysis failed: ${analysisResponse.status}`,
-      );
+      throw new Error(`VirusTotal analysis failed: ${analysisResponse.status}`);
     }
 
-    const status =
-      analysisData?.data?.attributes?.status ??
-      "unknown";
-
-    console.log(
-      `VirusTotal analysis ${attempt}/${maxAttempts}:`,
-      status,
-    );
-
-    // --------------------------------
-    // Analysis completed
-    // --------------------------------
+    const status = analysisData?.data?.attributes?.status ?? "unknown";
 
     if (status === "completed") {
-      const stats =
-        analysisData?.data?.attributes?.stats ??
-        EMPTY_STATS;
-
-      console.log(
-        "VirusTotal final stats:",
-        stats,
-      );
+      const stats = analysisData?.data?.attributes?.stats ?? EMPTY_STATS;
 
       return {
         stats: {
@@ -231,7 +153,5 @@ export const checkUrlWithVirusTotal = async (
     }
   }
 
-  throw new Error(
-    "VirusTotal analysis timed out",
-  );
+  throw new Error("VirusTotal analysis timed out");
 };
