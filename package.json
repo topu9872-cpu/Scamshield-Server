@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@google/genai": "^2.15.0",
+    "@googlemaps/google-maps-services-js": "^3.4.2",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^4.19.2",

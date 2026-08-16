@@ -14,6 +14,8 @@ import { checkUrlWithGoogle } from "./googleSafeBrowsing.js";
 import { analyzeWithGemini } from "./gemini.js";
 import { checkUrlWithVirusTotal } from "./utils/virusTotal.js";
 import { scorePhoneRisk, scoreUrlRisk, scoreTextRisk } from "./riskScoring.js";
+import { extractDomain, getCompanyNameFromDomain, getWebsiteInfo } from "./services/company.js";
+
 
 dotenv.config();
 const app = express();
@@ -242,6 +244,28 @@ async function run() {
         let googleMatches = 0;
         let isKnownScam = false;
 
+
+        let company = null;
+
+if (type === "url") {
+  const domain = extractDomain(value);
+
+  if (domain) {
+    const [websiteInfo] = await Promise.all([
+      getWebsiteInfo(value),
+    ]);
+
+    company = {
+      domain,
+      name: getCompanyNameFromDomain(domain),
+      website: value,
+      title: websiteInfo?.title ?? null,
+      description: websiteInfo?.description ?? null,
+      image: websiteInfo?.image ?? null,
+    };
+  }
+}
+
         // ==========================================
         // URL CHECK
         // ==========================================
@@ -254,6 +278,7 @@ async function run() {
               return {
                 matches: [],
               };
+              
             }),
 
             checkUrlWithVirusTotal(value).catch((error: unknown) => {
@@ -269,9 +294,16 @@ async function run() {
                 status: "failed",
                 analysisId: "",
               };
+              
             }),
+            
           ]);
 
+  console.log(
+    "GOOGLE SAFE BROWSING RESULT:",
+    googleResponse
+  );
+  
          googleResult = googleResponse ?? { matches: [] };
 virusTotalResult = virusTotalResponse ?? { 
   stats: { malicious: 0, suspicious: 0, harmless: 0, undetected: 0 } 
@@ -338,17 +370,6 @@ googleMatches = Array.isArray(googleResult.matches)
           evidenceScore = scoreTextRisk(type, value, malicious, suspicious);
         }
 
-        console.log("================================");
-        console.log("LOCAL RISK ANALYSIS");
-        console.log("Type:", type);
-        console.log("Value:", value);
-        console.log("Context:", context || "None");
-        console.log("Known scam:", isKnownScam);
-        console.log("Malicious:", malicious);
-        console.log("Suspicious:", suspicious);
-        console.log("Google matches:", googleMatches);
-        console.log("Evidence score:", evidenceScore);
-        console.log("================================");
 
         // ==========================================
         // FALLBACK
@@ -402,7 +423,6 @@ googleMatches = Array.isArray(googleResult.matches)
             context,
           );
 
-          console.log("GEMINI RESULT:", gemini);
 
           const geminiScore = Math.max(
             0,
@@ -423,12 +443,6 @@ googleMatches = Array.isArray(googleResult.matches)
                 : fallbackResult.insights,
           };
 
-          console.log("================================");
-          console.log("GEMINI SCORE:", geminiScore);
-          console.log("LOCAL SCORE:", evidenceScore);
-          console.log("FINAL SCORE:", finalScore);
-          console.log("FINAL IS SCAM:", finalScore >= 60);
-          console.log("================================");
         } catch (error) {
           console.error("GEMINI FAILED:", error);
         }
@@ -480,16 +494,18 @@ googleMatches = Array.isArray(googleResult.matches)
         // ==========================================
 
         return res.status(200).json({
-          success: true,
-          isScam: scanDocument.isScam,
-          score: scanDocument.score,
-          summary: scanDocument.summary,
-          insights: scanDocument.insights,
-          scanId,
-        });
+  success: true,
+  isScam: scanDocument.isScam,
+  score: scanDocument.score,
+  summary: scanDocument.summary,
+  insights: scanDocument.insights,
+  scanId,
+  company,
+});
       } catch (error) {
         return handleError(res, error, "Scanner Route Error");
       }
+      
     },
   );
   // --- SCAN HISTORY ---

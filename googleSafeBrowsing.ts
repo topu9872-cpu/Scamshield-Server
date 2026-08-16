@@ -1,6 +1,7 @@
-const API_KEY = process.env.GOOGLE_SAFE_BROWSING_API_KEY;
+
 
 export const checkUrlWithGoogle = async (url: string) => {
+  const API_KEY = process.env.GOOGLE_SAFE_BROWSING_API_KEY;
   if (!API_KEY) {
     console.warn("Google Safe Browsing API key not set");
     return null;
