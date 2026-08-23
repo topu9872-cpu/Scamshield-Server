@@ -456,3 +456,93 @@ OUTPUT RULES
     insights,
   };
 };
+
+
+export const identifyCompany = async (
+  domain: string,
+  title?: string,
+  description?: string,
+): Promise<string | null> => {
+  const apiKey = process.env.GEMINI_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("GEMINI_API_KEY is missing");
+  }
+
+  const ai = new GoogleGenAI({
+    apiKey,
+  });
+
+  const prompt = `
+Identify the real company or organization behind this website.
+
+Domain:
+${domain}
+
+Website Title:
+${title || "Unknown"}
+
+Website Description:
+${description || "Unknown"}
+
+Return ONLY valid JSON:
+
+{
+  "companyName": "OpenAI"
+}
+
+Rules:
+- Identify the actual company or organization that operates this domain.
+- Do not simply use the domain name.
+- Use the website title and description as supporting evidence.
+- If it is a personal website, organization, government site, university, etc., return its actual organization name.
+- If you cannot confidently identify it, return null.
+- Do not guess.
+
+Examples:
+
+Domain: chatgpt.com
+Company: OpenAI
+
+Domain: github.com
+Company: GitHub
+
+Domain: facebook.com
+Company: Meta Platforms
+
+Return JSON only.
+`;
+
+  try {
+    const response = await ai.models.generateContent({
+      model: "gemini-3.6-flash",
+      contents: prompt,
+    });
+
+    const text = response.text?.trim();
+
+    if (!text) {
+      return null;
+    }
+
+    const cleanText = text
+      .replace(/^```json\s*/i, "")
+      .replace(/^```\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim();
+
+    const result = JSON.parse(cleanText);
+
+    if (
+      typeof result.companyName !== "string" ||
+      !result.companyName.trim()
+    ) {
+      return null;
+    }
+
+    return result.companyName.trim();
+  } catch (error) {
+    console.error("Company identification error:", error);
+    return null;
+  }
+};

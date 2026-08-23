@@ -1,4 +1,3 @@
-
 export const extractDomain = (value: string): string => {
   try {
     const url = value.startsWith("http")
@@ -9,18 +8,50 @@ export const extractDomain = (value: string): string => {
   } catch {
     return "";
   }
-  
 };
-
 
 export const getCompanyNameFromDomain = (
   domain: string
 ): string => {
-  const name = domain.split(".")[0] ?? "";
+  const clean = domain
+    .trim()
+    .toLowerCase()
+    .replace(/^www\./, "");
 
-  return name
+  const parts = clean.split(".").filter(Boolean);
+
+  if (parts.length === 0) return "";
+
+  let rawName = "";
+
+  const multiPartTlds = [
+    "co.uk",
+    "com.au",
+    "co.in",
+    "gov.uk",
+    "ac.uk",
+  ];
+
+  const endsWithTld = multiPartTlds.find((tld) =>
+    clean.endsWith(tld)
+  );
+
+  if (endsWithTld && parts.length >= 3) {
+    rawName =
+      parts[parts.length - 3] ??
+      parts[0] ??
+      "";
+  } else {
+    rawName =
+      parts.length >= 2
+        ? parts[parts.length - 2] ?? ""
+        : parts[0] ?? "";
+  }
+
+  return rawName
     .replace(/[-_]/g, " ")
     .split(" ")
+    .filter(Boolean)
     .map(
       (word) =>
         word.charAt(0).toUpperCase() +
@@ -29,38 +60,62 @@ export const getCompanyNameFromDomain = (
     .join(" ");
 };
 
-
 export const getWebsiteInfo = async (url: string) => {
   try {
-    const response = await fetch(
-      url.startsWith("http") ? url : `https://${url}`,
-      {
-        headers: {
-          "User-Agent": "ScamShield/1.0",
-        },
-      }
-    );
+    const websiteUrl = url.startsWith("http")
+      ? url
+      : `https://${url}`;
 
-    if (!response.ok) return null;
+    const response = await fetch(websiteUrl, {
+      headers: {
+        "User-Agent": "ScamShield/1.0",
+      },
+    });
+
+    if (!response.ok) {
+      return null;
+    }
 
     const html = await response.text();
 
-    const title =
-      html.match(/<title[^>]*>(.*?)<\/title>/i)?.[1]?.trim() ?? "";
+    // Website title
+    const titleMatch = html.match(
+      /<title[^>]*>(.*?)<\/title>/is
+    );
 
-    const description =
-      html
-        .match(
-          /<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)["']/i
-        )?.[1]
-        ?.trim() ?? "";
+    const title = titleMatch?.[1]?.trim() ?? "";
 
-    const image =
-      html
-        .match(
-          /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']*)["']/i
-        )?.[1]
-        ?.trim() ?? "";
+    // Meta content helper
+    const getMetaContent = (
+      nameOrProp: string,
+      attr: "name" | "property"
+    ): string => {
+      const regex = new RegExp(
+        `<meta[^>]+${attr}=["']${nameOrProp}["'][^>]+content=["']([^"']*)["']|` +
+          `<meta[^>]+content=["']([^"']*)["'][^>]+${attr}=["']${nameOrProp}["']`,
+        "i"
+      );
+
+      const match = html.match(regex);
+
+      if (!match) return "";
+
+      return (
+        match[1] ||
+        match[2] ||
+        ""
+      ).trim();
+    };
+
+    const description = getMetaContent(
+      "description",
+      "name"
+    );
+
+    const image = getMetaContent(
+      "og:image",
+      "property"
+    );
 
     return {
       title,

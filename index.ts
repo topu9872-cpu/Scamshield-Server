@@ -11,12 +11,16 @@ import dotenv from "dotenv";
 import nodemailer from "nodemailer";
 import { scanSchema } from "./scan.js";
 import { checkUrlWithGoogle } from "./googleSafeBrowsing.js";
-import { analyzeWithGemini } from "./gemini.js";
+import { analyzeWithGemini, identifyCompany } from "./gemini.js";
 import { checkUrlWithVirusTotal } from "./utils/virusTotal.js";
 import { scorePhoneRisk, scoreUrlRisk, scoreTextRisk } from "./riskScoring.js";
-import { extractDomain, getCompanyNameFromDomain, getWebsiteInfo } from "./services/company.js";
+import {
+  extractDomain,
+  getCompanyNameFromDomain,
+  getWebsiteInfo,
+} from "./services/company.js";
 import { getCompanyLocation } from "./services/location.js";
-
+import { calculateTrustScore } from "./services/terstScore.js";
 
 dotenv.config();
 const app = express();
@@ -245,27 +249,24 @@ async function run() {
         let googleMatches = 0;
         let isKnownScam = false;
 
-
         let company = null;
 
-if (type === "url") {
-  const domain = extractDomain(value);
+        if (type === "url") {
+          const domain = extractDomain(value);
 
-  if (domain) {
-    const [websiteInfo] = await Promise.all([
-      getWebsiteInfo(value),
-    ]);
+          if (domain) {
+            const [websiteInfo] = await Promise.all([getWebsiteInfo(value)]);
 
-    company = {
-      domain,
-      name: getCompanyNameFromDomain(domain),
-      website: value,
-      title: websiteInfo?.title ?? null,
-      description: websiteInfo?.description ?? null,
-      image: websiteInfo?.image ?? null,
-    };
-  }
-}
+            company = {
+              domain,
+              name: getCompanyNameFromDomain(domain),
+              website: value,
+              title: websiteInfo?.title ?? null,
+              description: websiteInfo?.description ?? null,
+              image: websiteInfo?.image ?? null,
+            };
+          }
+        }
 
         // ==========================================
         // URL CHECK
@@ -279,7 +280,6 @@ if (type === "url") {
               return {
                 matches: [],
               };
-              
             }),
 
             checkUrlWithVirusTotal(value).catch((error: unknown) => {
@@ -295,27 +295,20 @@ if (type === "url") {
                 status: "failed",
                 analysisId: "",
               };
-              
             }),
-            
           ]);
 
-  console.log(
-    "GOOGLE SAFE BROWSING RESULT:",
-    googleResponse
-  );
+          googleResult = googleResponse ?? { matches: [] };
+          virusTotalResult = virusTotalResponse ?? {
+            stats: { malicious: 0, suspicious: 0, harmless: 0, undetected: 0 },
+          };
 
-         googleResult = googleResponse ?? { matches: [] };
-virusTotalResult = virusTotalResponse ?? { 
-  stats: { malicious: 0, suspicious: 0, harmless: 0, undetected: 0 } 
-};
+          malicious = Number(virusTotalResult.stats?.malicious ?? 0);
+          suspicious = Number(virusTotalResult.stats?.suspicious ?? 0);
 
-malicious = Number(virusTotalResult.stats?.malicious ?? 0);
-suspicious = Number(virusTotalResult.stats?.suspicious ?? 0);
-
-googleMatches = Array.isArray(googleResult.matches)
-  ? googleResult.matches.length
-  : 0;
+          googleMatches = Array.isArray(googleResult.matches)
+            ? googleResult.matches.length
+            : 0;
         }
 
         // ==========================================
@@ -371,7 +364,6 @@ googleMatches = Array.isArray(googleResult.matches)
           evidenceScore = scoreTextRisk(type, value, malicious, suspicious);
         }
 
-
         // ==========================================
         // FALLBACK
         // ==========================================
@@ -424,7 +416,6 @@ googleMatches = Array.isArray(googleResult.matches)
             context,
           );
 
-
           const geminiScore = Math.max(
             0,
             Math.min(100, Math.round(Number(gemini.score) || 0)),
@@ -443,7 +434,6 @@ googleMatches = Array.isArray(googleResult.matches)
                 ? gemini.insights.map(String).slice(0, 3)
                 : fallbackResult.insights,
           };
-
         } catch (error) {
           console.error("GEMINI FAILED:", error);
         }
@@ -495,18 +485,17 @@ googleMatches = Array.isArray(googleResult.matches)
         // ==========================================
 
         return res.status(200).json({
-  success: true,
-  isScam: scanDocument.isScam,
-  score: scanDocument.score,
-  summary: scanDocument.summary,
-  insights: scanDocument.insights,
-  scanId,
-  company,
-});
+          success: true,
+          isScam: scanDocument.isScam,
+          score: scanDocument.score,
+          summary: scanDocument.summary,
+          insights: scanDocument.insights,
+          scanId,
+          company,
+        });
       } catch (error) {
         return handleError(res, error, "Scanner Route Error");
       }
-      
     },
   );
   // --- SCAN HISTORY ---
@@ -517,7 +506,7 @@ googleMatches = Array.isArray(googleResult.matches)
         const { email } = req.params;
         const page = Math.max(1, Number(req.query.page ?? 1));
         const limit = Math.min(50, Math.max(1, Number(req.query.limit ?? 8)));
-        
+
         // Extract query params sent by the frontend
         const sortBy = (req.query.sortBy as string) || "createdAt";
         const sortOrder = (req.query.sortOrder as string) === "asc" ? 1 : -1;
@@ -580,89 +569,307 @@ googleMatches = Array.isArray(googleResult.matches)
   );
 
 
-app.get("/company-details", async (req: Request, res: Response) => {
-  try {
-    const { url } = req.query;
+app.get(
+  "/company-details",
+  async (req: Request, res: Response) => {
+    try {
+      const { url } = req.query;
 
-    if (!url || typeof url !== "string") {
-      return res.status(400).json({
-        success: false,
-        message: "URL is required",
+      // ==========================================
+      // 1. VALIDATE URL
+      // ==========================================
+
+      if (!url || typeof url !== "string") {
+        return res.status(400).json({
+          success: false,
+          message: "URL is required",
+        });
+      }
+
+      // ==========================================
+      // 2. EXTRACT DOMAIN
+      // ==========================================
+
+      const domain = extractDomain(url);
+
+      if (!domain) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid URL",
+        });
+      }
+
+      console.log("DOMAIN:", domain);
+
+      // ==========================================
+      // 3. GET COMPANY NAME FROM DOMAIN
+      // ==========================================
+
+      const domainCompanyName =
+        getCompanyNameFromDomain(domain);
+
+      console.log(
+        "DOMAIN COMPANY:",
+        domainCompanyName
+      );
+
+      // ==========================================
+      // 4. GET WEBSITE INFORMATION
+      // ==========================================
+
+      const website =
+        await getWebsiteInfo(url).catch(() => null);
+
+      console.log("WEBSITE INFO:", website);
+
+      // ==========================================
+      // 5. AI COMPANY IDENTIFICATION
+      // ==========================================
+
+      const aiCompanyName =
+        await identifyCompany(
+          domain,
+          website?.title,
+          website?.description
+        ).catch((error) => {
+          console.error(
+            "Company identification error:",
+            error
+          );
+
+          return null;
+        });
+
+      console.log(
+        "AI COMPANY:",
+        aiCompanyName
+      );
+
+      // ==========================================
+      // 6. FINAL COMPANY NAME
+      // ==========================================
+
+      const finalCompanyName =
+        typeof aiCompanyName === "string" &&
+        aiCompanyName.trim()
+          ? aiCompanyName.trim()
+          : domainCompanyName;
+
+      console.log(
+        "FINAL COMPANY NAME:",
+        finalCompanyName
+      );
+
+      // ==========================================
+      // 7. LOCATION LOOKUP
+      // ==========================================
+
+      const wiki =
+        await getCompanyLocation(
+          finalCompanyName,
+          domain,
+          website?.description
+        ).catch((error) => {
+          console.error(
+            "Company location error:",
+            error
+          );
+
+          return null;
+        });
+
+      console.log(
+        "WIKI RESPONSE:",
+        wiki
+      );
+
+      // ==========================================
+      // 8. TRUST SCORE
+      // ==========================================
+
+      const trustScore =
+        calculateTrustScore({
+          malicious: 0,
+          suspicious: 0,
+          googleMatches: 0,
+          https: url.startsWith("https://"),
+          hasMetadata: Boolean(
+            website?.title ||
+              website?.description
+          ),
+        });
+
+      // ==========================================
+      // 9. RATING
+      // ==========================================
+
+      const calculatedRating =
+        trustScore >= 80
+          ? 4.8
+          : trustScore >= 50
+          ? 3.5
+          : 2.0;
+
+      const reviewCount =
+        trustScore >= 80
+          ? 124
+          : trustScore >= 50
+          ? 45
+          : 12;
+
+      // ==========================================
+      // 10. VALIDATE MAP COORDINATES
+      // ==========================================
+
+      const hasValidCoords =
+        wiki !== null &&
+        typeof wiki.lat === "number" &&
+        typeof wiki.lon === "number" &&
+        Number.isFinite(wiki.lat) &&
+        Number.isFinite(wiki.lon);
+
+      // ==========================================
+      // 11. RESPONSE
+      // ==========================================
+
+      return res.json({
+        success: true,
+
+        company: {
+          // Use final company name
+          name: finalCompanyName,
+
+          domain,
+
+          title:
+            website?.title ?? null,
+
+          description:
+            website?.description ??
+            wiki?.summary ??
+            null,
+
+          image:
+            website?.image ??
+            wiki?.image ??
+            null,
+
+          website:
+            `https://${domain}`,
+
+          // ======================================
+          // LOCATION
+          // ======================================
+
+          location:
+            wiki?.address ?? null,
+
+          city:
+            wiki?.city ?? null,
+
+          state:
+            wiki?.state ?? null,
+
+          country:
+            wiki?.country ?? null,
+
+          // ======================================
+          // MAP
+          // ======================================
+
+          map: hasValidCoords
+            ? {
+                lat: wiki!.lat,
+                lon: wiki!.lon,
+              }
+            : null,
+
+          // ======================================
+          // WIKIPEDIA
+          // ======================================
+
+          wikipedia:
+            wiki?.wikipedia ?? null,
+
+          // ======================================
+          // RATING
+          // ======================================
+
+          rating:
+            calculatedRating,
+
+          reviews:
+            reviewCount,
+
+          trustScore,
+
+          isScam: false,
+        },
       });
+    } catch (error) {
+      console.error(
+        "Company Details Error:",
+        error
+      );
+
+      return handleError(
+        res,
+        error,
+        "Company Details Error"
+      );
     }
-
-    const domain = extractDomain(url);
-
-    if (!domain) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid URL",
-      });
-    }
-
-    const companyName = getCompanyNameFromDomain(domain);
-
-    const website = await getWebsiteInfo(url);
-    const location = await getCompanyLocation(companyName);
-
-    return res.json({
-      success: true,
-      company: {
-        name: companyName,
-        domain,
-        title: website?.title ?? null,
-        description: website?.description ?? null,
-        image: website?.image ?? null,
-        website: `https://${domain}`,
-
-        location: location?.address ?? null,
-
-        map: location
-          ? {
-              lat: location.lat,
-              lon: location.lon,
-            }
-          : null,
-
-        rating: Number((3.8 + Math.random() * 1.2).toFixed(1)),
-        reviews: Math.floor(500 + Math.random() * 9500),
-
-        isScam: false,
-      },
-    });
-  } catch (error) {
-    return handleError(res, error, "Company Details Error");
   }
-});
+);
 
-  app.delete(
-    "/scan-history/:id",
-    async (req: Request, res: Response): Promise<any> => {
-      try {
-        const id = Array.isArray(req.params.id)
-          ? req.params.id[0]
-          : req.params.id;
-        if (!id || !ObjectId.isValid(id))
-          return res
-            .status(400)
-            .json({ success: false, message: "Invalid ID" });
-        if (!scanHistoryCollection)
-          return res
-            .status(503)
-            .json({ success: false, message: "Database not available" });
+app.delete(
+  "/scan-history/:id",
+  async (
+    req: Request,
+    res: Response
+  ): Promise<any> => {
+    try {
+      const id = Array.isArray(req.params.id)
+        ? req.params.id[0]
+        : req.params.id;
 
-        const result = await scanHistoryCollection.deleteOne({
+      if (
+        !id ||
+        !ObjectId.isValid(id)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid ID",
+        });
+      }
+
+      if (!scanHistoryCollection) {
+        return res.status(503).json({
+          success: false,
+          message: "Database not available",
+        });
+      }
+
+      const result =
+        await scanHistoryCollection.deleteOne({
           _id: new ObjectId(id),
         });
-        console.log(result);
-        return res
-          .status(200)
-          .json({ success: true, message: "Deleted successfully", result });
-      } catch (error) {
-        return handleError(res, error, "Delete Error");
-      }
-    },
-  );
+
+      console.log(result);
+
+      return res.status(200).json({
+        success: true,
+        message: "Deleted successfully",
+        result,
+      });
+    } catch (error) {
+      return handleError(
+        res,
+        error,
+        "Delete Error"
+      );
+    }
+  }
+);
 
   app.listen(port, () =>
     console.log(`ScamShield server running on port ${port}`),
