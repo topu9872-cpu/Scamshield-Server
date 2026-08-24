@@ -25,7 +25,7 @@ dotenv.config();
 const app = express();
 app.use(cors(), express.json());
 
-const port = Number(process.env.PORT ?? 5000);
+const port = Number(process.env.PORT) || 5000;
 const uri = process.env.MONGODB_URI;
 if (!uri) throw new Error("MONGODB_URI is required");
 
@@ -75,6 +75,13 @@ async function run() {
   } catch (error) {
     console.error("MongoDB connection error:", error);
   }
+
+  app.get("/", (_req: Request, res: Response) => {
+  res.status(200).json({
+    success: true,
+    message: "ScamShield API is running",
+  });
+});
 
   // --- USERS ---
   app.post("/user", async (req: Request, res: Response): Promise<any> => {
@@ -567,10 +574,7 @@ async function run() {
     },
   );
 
-
-app.get(
-  "/company-details",
-  async (req: Request, res: Response) => {
+  app.get("/company-details", async (req: Request, res: Response) => {
     try {
       const { url } = req.query;
 
@@ -604,40 +608,33 @@ app.get(
       // 3. GET COMPANY NAME FROM DOMAIN
       // ==========================================
 
-      const domainCompanyName =
-        getCompanyNameFromDomain(domain);
+      const domainCompanyName = getCompanyNameFromDomain(domain);
 
       // ==========================================
       // 4. GET WEBSITE INFORMATION
       // ==========================================
 
-      const website =
-        await getWebsiteInfo(url).catch(() => null);
+      const website = await getWebsiteInfo(url).catch(() => null);
 
       // ==========================================
       // 5. AI COMPANY IDENTIFICATION
       // ==========================================
 
-      const aiCompanyName =
-        await identifyCompany(
-          domain,
-          website?.title,
-          website?.description
-        ).catch((error) => {
-          console.error(
-            "Company identification error:",
-            error
-          );
-          return null;
-        });
+      const aiCompanyName = await identifyCompany(
+        domain,
+        website?.title,
+        website?.description,
+      ).catch((error) => {
+        console.error("Company identification error:", error);
+        return null;
+      });
 
       // ==========================================
       // 6. FINAL COMPANY NAME
       // ==========================================
 
       const finalCompanyName =
-        typeof aiCompanyName === "string" &&
-        aiCompanyName.trim()
+        typeof aiCompanyName === "string" && aiCompanyName.trim()
           ? aiCompanyName.trim()
           : domainCompanyName;
 
@@ -645,17 +642,13 @@ app.get(
       // 7. TRUST SCORE
       // ==========================================
 
-      const trustScore =
-        calculateTrustScore({
-          malicious: 0,
-          suspicious: 0,
-          googleMatches: 0,
-          https: url.startsWith("https://"),
-          hasMetadata: Boolean(
-            website?.title ||
-              website?.description
-          ),
-        });
+      const trustScore = calculateTrustScore({
+        malicious: 0,
+        suspicious: 0,
+        googleMatches: 0,
+        https: url.startsWith("https://"),
+        hasMetadata: Boolean(website?.title || website?.description),
+      });
 
       // ==========================================
       // 8. RESPONSE
@@ -668,15 +661,11 @@ app.get(
           name: finalCompanyName,
           domain,
 
-          title:
-            website?.title ?? null,
+          title: website?.title ?? null,
 
-          description:
-            website?.description ??
-            null,
+          description: website?.description ?? null,
 
-          image:
-            website?.image ?? null,
+          image: website?.image ?? null,
 
           website: `https://${domain}`,
 
@@ -686,73 +675,177 @@ app.get(
         },
       });
     } catch (error) {
-      console.error(
-        "Company Details Error:",
-        error
-      );
+      console.error("Company Details Error:", error);
 
-      return handleError(
-        res,
-        error,
-        "Company Details Error"
-      );
+      return handleError(res, error, "Company Details Error");
     }
-  }
-);
+  });
 
-app.delete(
-  "/scan-history/:id",
-  async (
-    req: Request,
-    res: Response
-  ): Promise<any> => {
-    try {
-      const id = Array.isArray(req.params.id)
-        ? req.params.id[0]
-        : req.params.id;
+  app.delete(
+    "/scan-history/:id",
+    async (req: Request, res: Response): Promise<any> => {
+      try {
+        const id = Array.isArray(req.params.id)
+          ? req.params.id[0]
+          : req.params.id;
 
-      if (
-        !id ||
-        !ObjectId.isValid(id)
-      ) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid ID",
-        });
-      }
+        if (!id || !ObjectId.isValid(id)) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid ID",
+          });
+        }
 
-      if (!scanHistoryCollection) {
-        return res.status(503).json({
-          success: false,
-          message: "Database not available",
-        });
-      }
+        if (!scanHistoryCollection) {
+          return res.status(503).json({
+            success: false,
+            message: "Database not available",
+          });
+        }
 
-      const result =
-        await scanHistoryCollection.deleteOne({
+        const result = await scanHistoryCollection.deleteOne({
           _id: new ObjectId(id),
         });
 
-      console.log(result);
+        console.log(result);
 
-      return res.status(200).json({
+        return res.status(200).json({
+          success: true,
+          message: "Deleted successfully",
+          result,
+        });
+      } catch (error) {
+        return handleError(res, error, "Delete Error");
+      }
+    },
+  );
+
+  app.get("/monthly-user-activity", async (req: Request, res: Response) => {
+    try {
+      const { email } = req.query;
+
+      // ==========================================
+      // 1. VALIDATE EMAIL
+      // ==========================================
+
+      if (!email || typeof email !== "string") {
+        return res.status(400).json({
+          success: false,
+          message: "Email is required",
+        });
+      }
+
+      // ==========================================
+      // 3. DATE RANGE
+      // ==========================================
+
+      const now = new Date();
+
+      const startDate = new Date(now.getFullYear(), now.getMonth() - 5, 1);
+
+      // ==========================================
+      // 4. GENERATE LAST 6 MONTHS
+      // ==========================================
+
+      const months = Array.from({ length: 6 }, (_, index) => {
+        const date = new Date(
+          now.getFullYear(),
+          now.getMonth() - (5 - index),
+          1,
+        );
+
+        return {
+          year: date.getFullYear(),
+          month: date.getMonth() + 1,
+          monthName: date.toLocaleString("en-US", {
+            month: "short",
+          }),
+          activity: 0,
+        };
+      });
+
+      // ==========================================
+      // 5. GET USER ACTIVITY
+      // ==========================================
+
+      const results = await scanHistoryCollection
+        .aggregate([
+          {
+            $match: {
+              userEmail: email,
+              createdAt: {
+                $gte: startDate,
+                $lte: now,
+              },
+            },
+          },
+
+          {
+            $group: {
+              _id: {
+                year: {
+                  $year: "$createdAt",
+                },
+
+                month: {
+                  $month: "$createdAt",
+                },
+              },
+
+              activity: {
+                $sum: 1,
+              },
+            },
+          },
+
+          {
+            $sort: {
+              "_id.year": 1,
+              "_id.month": 1,
+            },
+          },
+        ])
+        .toArray();
+
+      // ==========================================
+      // 6. MERGE WITH ALL 6 MONTHS
+      // ==========================================
+
+      results.forEach((item) => {
+        const month = months.find(
+          (m) => m.year === item._id.year && m.month === item._id.month,
+        );
+
+        if (month) {
+          month.activity = item.activity;
+        }
+      });
+
+      // ==========================================
+      // 7. RESPONSE
+      // ==========================================
+
+      return res.json({
         success: true,
-        message: "Deleted successfully",
-        result,
+        email,
+        data: months.map((month) => ({
+          month: month.monthName,
+          activity: month.activity,
+        })),
       });
     } catch (error) {
-      return handleError(
-        res,
-        error,
-        "Delete Error"
-      );
-    }
-  }
-);
+      console.error("Monthly user activity error:", error);
 
-  app.listen(port, () =>
-    console.log(`ScamShield server running on port ${port}`),
-  );
+      return res.status(500).json({
+        success: false,
+        message: "Failed to fetch user activity",
+      });
+    }
+  });
+
+
 }
+
+export default app;
 
 run();
