@@ -19,7 +19,6 @@ import {
   getCompanyNameFromDomain,
   getWebsiteInfo,
 } from "./services/company.js";
-import { getCompanyLocation } from "./services/location.js";
 import { calculateTrustScore } from "./services/terstScore.js";
 
 dotenv.config();
@@ -608,19 +607,12 @@ app.get(
       const domainCompanyName =
         getCompanyNameFromDomain(domain);
 
-      console.log(
-        "DOMAIN COMPANY:",
-        domainCompanyName
-      );
-
       // ==========================================
       // 4. GET WEBSITE INFORMATION
       // ==========================================
 
       const website =
         await getWebsiteInfo(url).catch(() => null);
-
-      console.log("WEBSITE INFO:", website);
 
       // ==========================================
       // 5. AI COMPANY IDENTIFICATION
@@ -636,14 +628,8 @@ app.get(
             "Company identification error:",
             error
           );
-
           return null;
         });
-
-      console.log(
-        "AI COMPANY:",
-        aiCompanyName
-      );
 
       // ==========================================
       // 6. FINAL COMPANY NAME
@@ -655,36 +641,8 @@ app.get(
           ? aiCompanyName.trim()
           : domainCompanyName;
 
-      console.log(
-        "FINAL COMPANY NAME:",
-        finalCompanyName
-      );
-
       // ==========================================
-      // 7. LOCATION LOOKUP
-      // ==========================================
-
-      const wiki =
-        await getCompanyLocation(
-          finalCompanyName,
-          domain,
-          website?.description
-        ).catch((error) => {
-          console.error(
-            "Company location error:",
-            error
-          );
-
-          return null;
-        });
-
-      console.log(
-        "WIKI RESPONSE:",
-        wiki
-      );
-
-      // ==========================================
-      // 8. TRUST SCORE
+      // 7. TRUST SCORE
       // ==========================================
 
       const trustScore =
@@ -700,45 +658,14 @@ app.get(
         });
 
       // ==========================================
-      // 9. RATING
-      // ==========================================
-
-      const calculatedRating =
-        trustScore >= 80
-          ? 4.8
-          : trustScore >= 50
-          ? 3.5
-          : 2.0;
-
-      const reviewCount =
-        trustScore >= 80
-          ? 124
-          : trustScore >= 50
-          ? 45
-          : 12;
-
-      // ==========================================
-      // 10. VALIDATE MAP COORDINATES
-      // ==========================================
-
-      const hasValidCoords =
-        wiki !== null &&
-        typeof wiki.lat === "number" &&
-        typeof wiki.lon === "number" &&
-        Number.isFinite(wiki.lat) &&
-        Number.isFinite(wiki.lon);
-
-      // ==========================================
-      // 11. RESPONSE
+      // 8. RESPONSE
       // ==========================================
 
       return res.json({
         success: true,
 
         company: {
-          // Use final company name
           name: finalCompanyName,
-
           domain,
 
           title:
@@ -746,60 +673,12 @@ app.get(
 
           description:
             website?.description ??
-            wiki?.summary ??
             null,
 
           image:
-            website?.image ??
-            wiki?.image ??
-            null,
+            website?.image ?? null,
 
-          website:
-            `https://${domain}`,
-
-          // ======================================
-          // LOCATION
-          // ======================================
-
-          location:
-            wiki?.address ?? null,
-
-          city:
-            wiki?.city ?? null,
-
-          state:
-            wiki?.state ?? null,
-
-          country:
-            wiki?.country ?? null,
-
-          // ======================================
-          // MAP
-          // ======================================
-
-          map: hasValidCoords
-            ? {
-                lat: wiki!.lat,
-                lon: wiki!.lon,
-              }
-            : null,
-
-          // ======================================
-          // WIKIPEDIA
-          // ======================================
-
-          wikipedia:
-            wiki?.wikipedia ?? null,
-
-          // ======================================
-          // RATING
-          // ======================================
-
-          rating:
-            calculatedRating,
-
-          reviews:
-            reviewCount,
+          website: `https://${domain}`,
 
           trustScore,
 
